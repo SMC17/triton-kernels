@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.pytest_cache/
+bench/figures/*.png
+!bench/figures/.gitkeep

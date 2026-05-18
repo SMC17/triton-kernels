@@ -1,0 +1,29 @@
+triton-kernels
+Copyright (c) 2026 Sean Collins
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+The kernel implementations follow well-documented prior art:
+
+- The fused-softmax kernel structurally matches Triton's own
+  `02-fused-softmax.py` tutorial. The implementation here was
+  written from specification (not copy-pasted), and the structure
+  is the canonical one any Triton tutorial would teach.
+
+- The fused-rmsnorm kernel is the standard single-pass formulation
+  with no novel claim attached.
+
+- The flash-attention v2 forward kernel implements the
+  online-softmax algorithm from Dao 2023 (arXiv:2307.08691). The
+  implementation here is fp32 forward-only; the full FA-v2 paper
+  covers backward, fp16, and tensor-core paths that this v0.1.0
+  does not.
+
+This repo claims no novel kernel work. The artifact is the
+benchmark harness + honest correctness + performance reporting on
+a small consumer Turing GPU, not the kernels themselves.
+
+SPDX-License-Identifier: AGPL-3.0-or-later

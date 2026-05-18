@@ -1,0 +1,60 @@
+{
+  "kernel": "flash-attention-v2-forward-causal",
+  "results": [
+    {
+      "B": 1,
+      "H": 8,
+      "M": 128,
+      "D": 64,
+      "triton_us": 241.96,
+      "ref_us": 266.08,
+      "triton_tflops": 0.069,
+      "ref_tflops": 0.063,
+      "speedup": 1.1
+    },
+    {
+      "B": 1,
+      "H": 8,
+      "M": 256,
+      "D": 64,
+      "triton_us": 754.74,
+      "ref_us": 356.92,
+      "triton_tflops": 0.089,
+      "ref_tflops": 0.188,
+      "speedup": 0.473
+    },
+    {
+      "B": 1,
+      "H": 8,
+      "M": 512,
+      "D": 64,
+      "triton_us": 2474.66,
+      "ref_us": 1111.03,
+      "triton_tflops": 0.108,
+      "ref_tflops": 0.242,
+      "speedup": 0.449
+    },
+    {
+      "B": 1,
+      "H": 8,
+      "M": 1024,
+      "D": 64,
+      "triton_us": 8205.14,
+      "ref_us": 4453.25,
+      "triton_tflops": 0.131,
+      "ref_tflops": 0.241,
+      "speedup": 0.543
+    },
+    {
+      "B": 1,
+      "H": 8,
+      "M": 2048,
+      "D": 64,
+      "triton_us": 32146.83,
+      "ref_us": 18556.24,
+      "triton_tflops": 0.134,
+      "ref_tflops": 0.231,
+      "speedup": 0.577
+    }
+  ]
+}

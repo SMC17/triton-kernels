@@ -1,0 +1,77 @@
+{
+  "kernel": "fused-softmax",
+  "results": [
+    {
+      "rows": 4096,
+      "cols": 128,
+      "triton_us": 132.64,
+      "torch_us": 45.46,
+      "triton_gbps": 31.62,
+      "torch_gbps": 92.26,
+      "speedup": 0.343
+    },
+    {
+      "rows": 4096,
+      "cols": 256,
+      "triton_us": 286.1,
+      "torch_us": 88.38,
+      "triton_gbps": 29.32,
+      "torch_gbps": 94.92,
+      "speedup": 0.309
+    },
+    {
+      "rows": 4096,
+      "cols": 512,
+      "triton_us": 256.22,
+      "torch_us": 174.18,
+      "triton_gbps": 65.48,
+      "torch_gbps": 96.32,
+      "speedup": 0.68
+    },
+    {
+      "rows": 4096,
+      "cols": 1024,
+      "triton_us": 348.29,
+      "torch_us": 347.5,
+      "triton_gbps": 96.34,
+      "torch_gbps": 96.56,
+      "speedup": 0.998
+    },
+    {
+      "rows": 4096,
+      "cols": 2048,
+      "triton_us": 700.87,
+      "torch_us": 738.66,
+      "triton_gbps": 95.75,
+      "torch_gbps": 90.85,
+      "speedup": 1.054
+    },
+    {
+      "rows": 4096,
+      "cols": 4096,
+      "triton_us": 1398.15,
+      "torch_us": 1412.17,
+      "triton_gbps": 96.0,
+      "torch_gbps": 95.04,
+      "speedup": 1.01
+    },
+    {
+      "rows": 4096,
+      "cols": 8192,
+      "triton_us": 2808.02,
+      "torch_us": 2792.88,
+      "triton_gbps": 95.6,
+      "torch_gbps": 96.11,
+      "speedup": 0.995
+    },
+    {
+      "rows": 4096,
+      "cols": 16384,
+      "triton_us": 5610.51,
+      "torch_us": 10418.09,
+      "triton_gbps": 95.69,
+      "torch_gbps": 51.53,
+      "speedup": 1.857
+    }
+  ]
+}
