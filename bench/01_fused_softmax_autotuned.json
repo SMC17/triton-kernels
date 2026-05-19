@@ -1,0 +1,110 @@
+{
+  "kernel": "fused-softmax",
+  "autotuned": true,
+  "results": [
+    {
+      "rows": 4096,
+      "cols": 128,
+      "triton_us": 218.13,
+      "torch_us": 45.55,
+      "triton_gbps": 19.23,
+      "torch_gbps": 92.07,
+      "speedup": 0.209,
+      "autotune": {
+        "num_warps": 2,
+        "num_stages": 4
+      }
+    },
+    {
+      "rows": 4096,
+      "cols": 256,
+      "triton_us": 447.57,
+      "torch_us": 88.86,
+      "triton_gbps": 18.74,
+      "torch_gbps": 94.4,
+      "speedup": 0.199,
+      "autotune": {
+        "num_warps": 2,
+        "num_stages": 2
+      }
+    },
+    {
+      "rows": 4096,
+      "cols": 512,
+      "triton_us": 618.49,
+      "torch_us": 289.26,
+      "triton_gbps": 27.13,
+      "torch_gbps": 58.0,
+      "speedup": 0.468,
+      "autotune": {
+        "num_warps": 2,
+        "num_stages": 2
+      }
+    },
+    {
+      "rows": 4096,
+      "cols": 1024,
+      "triton_us": 521.38,
+      "torch_us": 373.8,
+      "triton_gbps": 64.36,
+      "torch_gbps": 89.77,
+      "speedup": 0.717,
+      "autotune": {
+        "num_warps": 4,
+        "num_stages": 4
+      }
+    },
+    {
+      "rows": 4096,
+      "cols": 2048,
+      "triton_us": 987.78,
+      "torch_us": 772.42,
+      "triton_gbps": 67.94,
+      "torch_gbps": 86.88,
+      "speedup": 0.782,
+      "autotune": {
+        "num_warps": 8,
+        "num_stages": 2
+      }
+    },
+    {
+      "rows": 4096,
+      "cols": 4096,
+      "triton_us": 1691.17,
+      "torch_us": 1762.82,
+      "triton_gbps": 79.36,
+      "torch_gbps": 76.14,
+      "speedup": 1.042,
+      "autotune": {
+        "num_warps": 2,
+        "num_stages": 4
+      }
+    },
+    {
+      "rows": 4096,
+      "cols": 8192,
+      "triton_us": 2816.39,
+      "torch_us": 2784.72,
+      "triton_gbps": 95.31,
+      "torch_gbps": 96.4,
+      "speedup": 0.989,
+      "autotune": {
+        "num_warps": 16,
+        "num_stages": 4
+      }
+    },
+    {
+      "rows": 4096,
+      "cols": 16384,
+      "triton_us": 5626.14,
+      "torch_us": 9874.48,
+      "triton_gbps": 95.42,
+      "torch_gbps": 54.37,
+      "speedup": 1.755,
+      "autotune": {
+        "num_warps": 8,
+        "num_stages": 4
+      }
+    }
+  ]
+}

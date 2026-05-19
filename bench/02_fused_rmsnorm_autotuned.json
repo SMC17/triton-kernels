@@ -1,0 +1,97 @@
+{
+  "kernel": "fused-rmsnorm",
+  "autotuned": true,
+  "results": [
+    {
+      "rows": 4096,
+      "cols": 128,
+      "triton_us": 101.69,
+      "torch_us": 168.74,
+      "triton_gbps": 41.25,
+      "torch_gbps": 24.86,
+      "speedup": 1.659,
+      "autotune": {
+        "num_warps": 2,
+        "num_stages": 4
+      }
+    },
+    {
+      "rows": 4096,
+      "cols": 256,
+      "triton_us": 101.26,
+      "torch_us": 317.68,
+      "triton_gbps": 82.85,
+      "torch_gbps": 26.41,
+      "speedup": 3.137,
+      "autotune": {
+        "num_warps": 2,
+        "num_stages": 2
+      }
+    },
+    {
+      "rows": 4096,
+      "cols": 512,
+      "triton_us": 180.11,
+      "torch_us": 619.03,
+      "triton_gbps": 93.16,
+      "torch_gbps": 27.11,
+      "speedup": 3.437,
+      "autotune": {
+        "num_warps": 2,
+        "num_stages": 4
+      }
+    },
+    {
+      "rows": 4096,
+      "cols": 1024,
+      "triton_us": 351.98,
+      "torch_us": 1221.25,
+      "triton_gbps": 95.34,
+      "torch_gbps": 27.48,
+      "speedup": 3.47,
+      "autotune": {
+        "num_warps": 4,
+        "num_stages": 4
+      }
+    },
+    {
+      "rows": 4096,
+      "cols": 2048,
+      "triton_us": 695.86,
+      "torch_us": 2422.23,
+      "triton_gbps": 96.45,
+      "torch_gbps": 27.71,
+      "speedup": 3.481,
+      "autotune": {
+        "num_warps": 16,
+        "num_stages": 4
+      }
+    },
+    {
+      "rows": 4096,
+      "cols": 4096,
+      "triton_us": 1389.16,
+      "torch_us": 4832.57,
+      "triton_gbps": 96.63,
+      "torch_gbps": 27.78,
+      "speedup": 3.479,
+      "autotune": {
+        "num_warps": 16,
+        "num_stages": 2
+      }
+    },
+    {
+      "rows": 4096,
+      "cols": 8192,
+      "triton_us": 2827.42,
+      "torch_us": 9651.28,
+      "triton_gbps": 94.95,
+      "torch_gbps": 27.82,
+      "speedup": 3.413,
+      "autotune": {
+        "num_warps": 8,
+        "num_stages": 4
+      }
+    }
+  ]
+}

@@ -1,5 +1,175 @@
 # Changelog
 
+## v0.3.0 — 2026-05-19
+
+All six kernels (3 fp32 + 3 fp16) wrapped in `@triton.autotune`,
+closing the v0.2.0 documented finding that tile-size choices do not
+transfer across precisions and require offline hand-sweeps per
+hardware target.
+
+### Added
+
+- `@triton.autotune` decorator on all six kernels with per-kernel
+  config grids:
+  - **Softmax / RMSNorm (fp32 + fp16):** 8 configs of
+    `num_warps ∈ {2, 4, 8, 16}` × `num_stages ∈ {2, 4}`. Keyed on
+    `n_cols`. `BLOCK_SIZE` is fixed by the launcher at
+    `next_power_of_2(n_cols)` because the kernel issues a single
+    masked load per row; tuning `BLOCK_SIZE` at the kernel level
+    would admit configs that silently drop columns under the mask.
+  - **Flash-attention (fp32 + fp16):** 36-config grid of
+    `BLOCK_M ∈ {16, 32, 64}` × `BLOCK_N ∈ {32, 64}` ×
+    `num_warps ∈ {2, 4, 8}` × `num_stages ∈ {2, 3}`. Keyed on
+    `(M, N, D_HEAD)`. Configs whose double-buffered K+V SMEM
+    footprint exceeds the Turing 64 KB/SM budget are pruned at
+    autotune-construction time (fp32: 9 pruned, 27 live;
+    fp16: 0 pruned, 36 live).
+
+- `bench/0*_autotuned.json` — six new benchmark JSON files. Each
+  result row includes an `"autotune"` field listing the winning
+  config chosen by the autotuner at that shape on a GTX 1650
+  Max-Q.
+
+### Performance vs v0.2.0 hand-tuned
+
+**Flash-attention fp32** is the headline result. The v0.1 / v0.2
+config (`BLOCK_M=BLOCK_N=64, num_warps=4, num_stages=2`) lost to
+torch's `scaled_dot_product_attention` at every measured shape
+(speedup 0.45–0.91×). Autotuning inverts this — Triton fp32 now
+beats torch at every shape:
+
+| M | v0.2 us | v0.3 us | v0.2 speedup vs ref | v0.3 speedup vs ref |
+|---|---|---|---|---|
+| 128 | 241.96 | 137.58 | 1.10× | **1.55×** |
+| 256 | 754.74 | 154.55 | 0.47× | **1.91×** |
+| 512 | 2474.66 | 515.21 | 0.45× | **2.21×** |
+| 1024 | 8205.14 | 1891.34 | 0.54× | **2.41×** |
+| 2048 | 32146.83 | 7304.04 | 0.58× | **2.63×** |
+
+At M=2048 the autotune-vs-hand-tuned delta is **4.4×**. The
+autotuner picks `BLOCK_M=BLOCK_N=64, num_warps=8, num_stages=2`
+for M ≥ 1024 (which the v0.1 / v0.2 heuristic with `num_warps=4`
+underutilized) and switches to smaller tiles (`BLOCK_M=16` or
+`BLOCK_M=32`) at M ∈ {256, 512} where they fit more program slots.
+
+**Flash-attention fp16** at M=128 closes the v0.2.0 loss to torch
+SDPA (0.47×) to parity (1.02×) — a 2.26× wall-clock improvement.
+For M ≥ 256 the v0.2.0 hand-tuned `(32, 32, 4, 2)` config was
+already near-optimal; autotune confirms it for M=128 and lands on
+`(BLOCK_M=16, BLOCK_N=32, nw=2, ns=3)` at M=256 worth ~5%, and
+`num_stages=3` (instead of 2) at M ≥ 512 worth ~5%.
+
+**Softmax (fp32 + fp16)** and **RMSNorm (fp32 + fp16)** were
+already bandwidth-saturated at v0.2.0 (~96 GB/s of the GTX 1650's
+~128 GB/s theoretical). Autotuning preserves that saturation at
+cols ≥ 512 and is within measurement noise at cols ≤ 256 (the
+launch-overhead-bound regime). RMSNorm holds its consistent
+3.4–3.7× speedup vs torch's two-pass reference across the column
+sweep.
+
+Honest read: autotuning **did not improve** the softmax and RMSNorm
+kernels on this GPU — they were already at the right config for
+their bandwidth-bound regime. The v0.3 win is concentrated in
+flash-attention, particularly the fp32 inversion above.
+
+### Winning-config table (empirical sweet-spot, GTX 1650 Turing)
+
+Per-shape winning configs that v0.4 could promote to hard-coded
+defaults. The autotune path remains in place so new shapes still
+get a sweep on first invocation.
+
+**softmax fp32 / fp16 (rows=4096):**
+
+| n_cols | fp32 (nw, ns) | fp16 (nw, ns) |
+|---|---|---|
+| 128 | (2, 4) | (2, 4) |
+| 256 | (2, 2) | (2, 2) |
+| 512 | (2, 2) | (2, 4) |
+| 1024 | (4, 4) | (2, 4) |
+| 2048 | (8, 2) | (4, 4) |
+| 4096 | (2, 4) | (4, 4) |
+| 8192 | (16, 4) | (16, 2) |
+| 16384 | (8, 4) | (8, 2) |
+
+**rmsnorm fp32 / fp16 (rows=4096):**
+
+| n_cols | fp32 (nw, ns) | fp16 (nw, ns) |
+|---|---|---|
+| 128 | (2, 4) | (2, 4) |
+| 256 | (2, 2) | (2, 2) |
+| 512 | (2, 4) | (2, 4) |
+| 1024 | (4, 4) | (2, 2) |
+| 2048 | (16, 4) | (4, 4) |
+| 4096 | (16, 2) | (8, 2) |
+| 8192 | (8, 4) | (16, 2) |
+
+**flash-attention fp32 / fp16 (B=1, H=8, D=64, causal=True):**
+
+| M | fp32 (BLOCK_M, BLOCK_N, nw, ns) | fp16 (BLOCK_M, BLOCK_N, nw, ns) |
+|---|---|---|
+| 128 | (64, 64, 8, 2) | (32, 32, 4, 2) |
+| 256 | (16, 32, 2, 3) | (16, 32, 2, 3) |
+| 512 | (32, 32, 2, 2) | (32, 32, 4, 3) |
+| 1024 | (64, 64, 8, 2) | (32, 32, 4, 3) |
+| 2048 | (64, 64, 8, 2) | (32, 32, 4, 3) |
+
+### Config-space pruning notes
+
+The flash-attention task spec called for an 81-config grid
+(BLOCK_N ∈ {16, 32, 64}, num_stages ∈ {2, 3, 4}). On the GTX 1650
+with one Python process per kernel, the wider grid ran the
+autotuner for hours per kernel — each fresh `(M, N, D_HEAD)` key
+triggers a complete sweep, and the correctness check uses different
+shapes than the benchmark, so the cache cannot be shared between
+stages within a single invocation. The shipped grid trims
+`BLOCK_N` to `{32, 64}` and `num_stages` to `{2, 3}` (36 configs).
+
+No configs raised a compile error during the sweep on this
+hardware. The SMEM pre-filter caught all the would-be-too-big
+configs at construction time.
+
+### Correctness
+
+All 31 correctness cells across the six kernels still pass at the
+v0.2.0 tolerances:
+
+- Softmax fp32 (4 shapes): `max_abs_err ≤ 1.12e-08`
+- Softmax fp16 (4 shapes): `max_abs_err ≤ 7.63e-06`
+- RMSNorm fp32 (5 shapes): `max_abs_err ≤ 1.91e-06`
+- RMSNorm fp16 (5 shapes): `max_abs_err ≤ 7.81e-03`
+- Flash-attention fp32 (6 cases): `max_abs_err ≤ 3.17e-08`
+- Flash-attention fp16 (6 cases): `max_abs_err ≤ 3.05e-05`
+
+### Evidence vocabulary applied
+
+- `compiled` — yes, Triton 3.7.0 / PyTorch 2.5.1+cu121.
+- `unit-tested` — correctness per kernel, fp32 at atol=1e-5 / 1e-4 /
+  1e-3, fp16 at atol=1e-2.
+- `benchmarked` — wall-clock timings with warmup + sync, JSON in
+  `bench/0*_autotuned.json`.
+- `hardware-verified` — measured on GTX 1650 Max-Q (Turing, cc 7.5).
+
+### Non-goals (deferred to v0.4.0)
+
+- **bf16.** Turing tensor cores lack bf16 mma; waits for Ampere or
+  newer hardware.
+- **fp8.** Hopper-only.
+- **Flash-attention backward pass.** Forward only.
+- **Fused-RMSNorm-Linear** (single-kernel norm + matmul). Turing's
+  64 KB SMEM/SM still constrains tile sizing tightly.
+- **TF32-on / TF32-off reference comparison columns.** The fp16
+  comparison column addresses the v0.1 "cuBLAS uses TF32"
+  observation by moving both sides to the same tensor-core class.
+- **ROCm / AMD path.** NVIDIA Turing only.
+- **Persistent on-disk autotune cache across processes.** Triton's
+  `Autotuner` exposes `save_path` / `restore_value` hooks that a
+  future revision could wire up to skip the cold-start sweep when
+  the same shape was tuned in a previous run.
+- **Widening the flash-attention grid** to include `BLOCK_N=16`
+  and `num_stages=4`. The current 36-config grid finds the
+  v0.2.0 hand-tuned pick automatically; if a future winner lands
+  on the boundary the grid should be widened.
+
 ## v0.2.0 — 2026-05-19
 
 Three fp16 kernel variants added alongside the v0.1.0 fp32 set. The

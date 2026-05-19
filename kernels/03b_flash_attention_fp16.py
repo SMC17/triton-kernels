@@ -7,10 +7,10 @@ with fp16 inputs and an fp32 accumulator (`out_dtype=tl.float32`),
 which routes through Turing's m16n8k16 / m16n8k8 fp16 tensor-core
 MMA instructions.
 
-This is the kernel where v0.2's headline thesis is tested: the fp32
-SIMT version (`03_flash_attention.py`) loses 2–3× to torch's
+This is the kernel where the headline tensor-core thesis is tested:
+the fp32 SIMT version (`03_flash_attention.py`) lost 2–3× to torch's
 `scaled_dot_product_attention` on Turing because torch's reference
-uses tensor cores (TF32) while the SIMT path doesn't. Switching this
+uses tensor cores (TF32) while the SIMT path didn't. Switching this
 kernel to fp16 puts both implementations on tensor cores; the
 remaining gap (if any) reflects what Triton-on-Turing leaves on the
 table relative to torch's tuned tensor-core path.
@@ -25,6 +25,15 @@ Numerical considerations:
 Tolerance vs reference: 1e-2 atol, 1e-2 rtol. fp16 has ~3-4 decimal
 digits of precision; tighter would hide real fp16 round-off.
 
+v0.3.0: wrapped in `@triton.autotune` over (BLOCK_M, BLOCK_N,
+num_warps, num_stages) keyed on (M, N, D_HEAD). The v0.2.0
+`BLOCK_M=BLOCK_N=32, num_warps=4, num_stages=2` hand-tuned pick is
+in the config grid alongside the larger and smaller tiles. Configs
+exceeding the Turing 64 KB SMEM budget are filtered out at
+autotune-construction time. fp16 dtype halves the per-element SMEM
+cost relative to fp32, so more aggressive tile sizes survive the
+pruning step here than in `03_flash_attention.py`.
+
 Hardware: GTX 1650 Max-Q (Turing, compute capability 7.5).
 """
 
@@ -37,6 +46,51 @@ import triton
 import triton.language as tl
 
 
+# Turing 64 KB SMEM/SM. fp16 tiles halve the per-element SMEM cost
+# vs fp32 so more aggressive tile sizes survive the budget check.
+# Estimate is the K+V double-buffered footprint; Q and softmax tiles
+# stay in registers in practice. See `03_flash_attention.py`.
+TURING_SMEM_BUDGET = 64 * 1024
+
+
+def _flash_attn_smem_bytes(BLOCK_M, BLOCK_N, D_HEAD, num_stages, dtype_bytes):
+    return 2 * BLOCK_N * D_HEAD * dtype_bytes * num_stages
+
+
+def _flash_attn_fp16_autotune_configs():
+    # Conservative starting grid. The task spec calls for
+    # BLOCK_M ∈ {16,32,64} × BLOCK_N ∈ {16,32,64} ×
+    # num_warps ∈ {2,4,8} × num_stages ∈ {2,3,4} (81 configs).
+    # On a single-GPU GTX 1650, compile-time for 81 configs across
+    # multiple shape keys was empirically untenable — each fresh
+    # (M,N,D) key triggers a full sweep. We trim to 36 configs and
+    # widen only if winners land on the grid boundary.
+    configs = []
+    skipped = 0
+    for BLOCK_M in (16, 32, 64):
+        for BLOCK_N in (32, 64):
+            for num_warps in (2, 4, 8):
+                for num_stages in (2, 3):
+                    smem = _flash_attn_smem_bytes(
+                        BLOCK_M, BLOCK_N, 64, num_stages, dtype_bytes=2
+                    )
+                    if smem > TURING_SMEM_BUDGET:
+                        skipped += 1
+                        continue
+                    configs.append(
+                        triton.Config(
+                            {"BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N},
+                            num_warps=num_warps,
+                            num_stages=num_stages,
+                        )
+                    )
+    return configs, skipped
+
+
+_FP16_CONFIGS, _FP16_SMEM_SKIPPED = _flash_attn_fp16_autotune_configs()
+
+
+@triton.autotune(configs=_FP16_CONFIGS, key=["M", "N", "D_HEAD"])
 @triton.jit
 def flash_attn_fwd_kernel_fp16(
     Q_ptr, K_ptr, V_ptr, O_ptr,
@@ -47,9 +101,9 @@ def flash_attn_fwd_kernel_fp16(
     H, M, N,
     sm_scale,
     IS_CAUSAL: tl.constexpr,
+    D_HEAD: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    D_HEAD: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_bh = tl.program_id(1)
@@ -141,26 +195,8 @@ def triton_flash_attn_fp16(
     if sm_scale is None:
         sm_scale = 1.0 / (D ** 0.5)
 
-    # Launch parameters picked from an offline sweep on GTX 1650 fp16:
-    # the fp32 kernel's BLOCK=64 num_warps=4 default is *catastrophic*
-    # for the fp16 tensor-core path (6× slower than necessary at M=512).
-    # The fp16 m16n8k16 mma instruction has different occupancy /
-    # register-pressure characteristics than the fp32 SIMT FMA path,
-    # and the sweep shows BLOCK_M=BLOCK_N=32 with num_warps=4 is robust
-    # across M=128..2048 on Turing; at M=128 only, the BLOCK_M=64
-    # BLOCK_N=32 num_warps=8 config is meaningfully faster.
-    # `@triton.autotune` over a richer grid is a v0.3 item.
-    # BLOCK_M=BLOCK_N=32, num_warps=4 is the robust pick across
-    # M=128..2048 from the offline sweep. At M=128 only, BLOCK_M=64
-    # BLOCK_N=32 num_warps=8 is meaningfully faster in microbenchmark
-    # (231 us vs 359 us), but the small-M regime fluctuates by run;
-    # ship one config so the artifact is deterministic.
-    BLOCK_M, BLOCK_N, num_warps, num_stages = 32, 32, 4, 2
-    BLOCK_M = min(BLOCK_M, triton.next_power_of_2(M))
-    BLOCK_N = min(BLOCK_N, triton.next_power_of_2(N))
-
     o = torch.empty_like(q)
-    grid = ((M + BLOCK_M - 1) // BLOCK_M, B * H)
+    grid = lambda META: ((M + META["BLOCK_M"] - 1) // META["BLOCK_M"], B * H)
     flash_attn_fwd_kernel_fp16[grid](
         q, k, v, o,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -170,11 +206,7 @@ def triton_flash_attn_fp16(
         H, M, N,
         sm_scale,
         IS_CAUSAL=is_causal,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
         D_HEAD=D,
-        num_warps=num_warps,
-        num_stages=num_stages,
     )
     return o
 
@@ -219,6 +251,22 @@ def correctness_check() -> bool:
     return all_ok
 
 
+def _winning_config_for(M: int, N: int, D: int) -> dict:
+    cache = flash_attn_fwd_kernel_fp16.cache
+    if not cache:
+        return {}
+    for key, cfg in cache.items():
+        if isinstance(key, tuple) and len(key) >= 3:
+            if key[0] == M and key[1] == N and key[2] == D:
+                return {
+                    "BLOCK_M": cfg.kwargs.get("BLOCK_M"),
+                    "BLOCK_N": cfg.kwargs.get("BLOCK_N"),
+                    "num_warps": cfg.num_warps,
+                    "num_stages": cfg.num_stages,
+                }
+    return {}
+
+
 def benchmark(out_path: str | None = None) -> dict:
     torch.manual_seed(0)
     B, H, D = 1, 8, 64
@@ -251,6 +299,7 @@ def benchmark(out_path: str | None = None) -> dict:
         flops = 4 * B * H * M * M * D * 0.5  # 0.5 because causal
         tflops_triton = flops / (t_triton * 1e-6) / 1e12
         tflops_ref = flops / (t_ref * 1e-6) / 1e12
+        cfg = _winning_config_for(M, M, D)
         results.append({
             "B": B, "H": H, "M": M, "D": D,
             "triton_us": round(t_triton, 2),
@@ -258,11 +307,19 @@ def benchmark(out_path: str | None = None) -> dict:
             "triton_tflops": round(tflops_triton, 3),
             "ref_tflops": round(tflops_ref, 3),
             "speedup": round(t_ref / t_triton, 3),
+            "autotune": cfg,
         })
         print(f"  B={B} H={H} M={M:5d} D={D}  triton={t_triton:8.2f}us  "
               f"ref={t_ref:8.2f}us  triton TFLOPS={tflops_triton:.3f}  "
-              f"speedup={t_ref / t_triton:.2f}x")
-    out = {"kernel": "flash-attention-v2-forward-causal-fp16", "dtype": "float16", "results": results}
+              f"speedup={t_ref / t_triton:.2f}x  cfg={cfg}")
+    out = {
+        "kernel": "flash-attention-v2-forward-causal-fp16",
+        "dtype": "float16",
+        "autotuned": True,
+        "smem_pruned_configs": _FP16_SMEM_SKIPPED,
+        "live_configs": len(_FP16_CONFIGS),
+        "results": results,
+    }
     if out_path:
         with open(out_path, "w") as f:
             json.dump(out, f, indent=2)
@@ -287,7 +344,8 @@ def main():
         print("OK")
         print()
     if args.bench:
-        print("=== benchmark (B=1, H=8, D=64, causal=True, fp16) ===")
+        print(f"=== benchmark (B=1, H=8, D=64, causal=True, fp16, autotuned)  "
+              f"[{len(_FP16_CONFIGS)} live configs, {_FP16_SMEM_SKIPPED} SMEM-pruned] ===")
         benchmark(out_path=args.out)
 
 

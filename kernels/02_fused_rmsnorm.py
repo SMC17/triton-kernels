@@ -11,14 +11,18 @@ This is a deliberate single-pass single-kernel implementation that
 assumes the per-row tensor fits in a single Triton block. For
 K > BLOCK_SIZE_MAX, a tiled / online variant is needed (the same
 shape Welford-style numeric stability would also apply); both are
-out of scope for v0.1.0 and are tracked in ROADMAP.md.
+out of scope for this artifact and are tracked as v0.4 work.
 
 The fused-rmsnorm-linear (RMSNorm + linear projection in one kernel)
-is a separate, harder artifact deferred to v0.3 — single-pass fusion
+is a separate, harder artifact still deferred — single-pass fusion
 of the norm reduction with a matmul accumulator requires careful
 shared-memory budgeting that the GTX 1650 (Turing, 64KB SMEM per SM)
-constrains tightly. v0.2.0 ships an fp16 variant of *this* kernel as
-`02b_fused_rmsnorm_fp16.py` but not the fused linear projection.
+constrains tightly.
+
+v0.3.0: `@triton.autotune` over a (num_warps, num_stages) grid keyed
+on `n_cols`. `BLOCK_SIZE` is set by the launcher to
+`next_power_of_2(n_cols)` since the kernel issues a single masked
+`tl.load` per row.
 
 Hardware: GTX 1650 Max-Q (Turing, compute capability 7.5).
 """
@@ -32,6 +36,15 @@ import triton
 import triton.language as tl
 
 
+def _rmsnorm_autotune_configs():
+    configs = []
+    for num_warps in (2, 4, 8, 16):
+        for num_stages in (2, 4):
+            configs.append(triton.Config({}, num_warps=num_warps, num_stages=num_stages))
+    return configs
+
+
+@triton.autotune(configs=_rmsnorm_autotune_configs(), key=["n_cols"])
 @triton.jit
 def rmsnorm_kernel(
     x_ptr,
@@ -73,12 +86,7 @@ def triton_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> 
     n_rows, n_cols = x.shape
     BLOCK_SIZE = triton.next_power_of_2(n_cols)
     assert BLOCK_SIZE <= 32768, \
-        f"K={n_cols} (BLOCK={BLOCK_SIZE}) exceeds single-pass kernel limit; tiled variant is v0.3 territory"
-    num_warps = 4
-    if BLOCK_SIZE >= 2048:
-        num_warps = 8
-    if BLOCK_SIZE >= 4096:
-        num_warps = 16
+        f"K={n_cols} (BLOCK={BLOCK_SIZE}) exceeds single-pass kernel limit; tiled variant deferred"
 
     y = torch.empty_like(x)
     rmsnorm_kernel[(n_rows,)](
@@ -87,14 +95,12 @@ def triton_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> 
         n_cols,
         eps,
         BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=num_warps,
     )
     return y
 
 
 def reference_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """PyTorch reference for correctness comparison."""
-    # torch.rms_norm exists in recent versions; fall back to manual if not.
     if hasattr(torch.nn.functional, "rms_norm"):
         return torch.nn.functional.rms_norm(x, normalized_shape=(x.shape[-1],), weight=weight, eps=eps)
     var = x.pow(2).mean(dim=-1, keepdim=True)
@@ -122,6 +128,21 @@ def correctness_check() -> bool:
         print(f"  shape={(rows, cols)} max_abs_err={max_abs_err:.2e} {'OK' if ok else 'FAIL'}")
         all_ok = all_ok and ok
     return all_ok
+
+
+def _winning_config_for(n_cols: int) -> dict:
+    cache = rmsnorm_kernel.cache
+    if not cache:
+        return {}
+    for key, cfg in cache.items():
+        cols = key[0] if isinstance(key, tuple) else key
+        if cols == n_cols:
+            return {
+                "num_warps": cfg.num_warps,
+                "num_stages": cfg.num_stages,
+                **cfg.kwargs,
+            }
+    return {}
 
 
 def benchmark(out_path: str | None = None) -> dict:
@@ -154,6 +175,7 @@ def benchmark(out_path: str | None = None) -> dict:
         bytes_moved = rows * cols * 4 * 2 + cols * 4
         gbps_triton = bytes_moved / (t_triton * 1e-6) / 1e9
         gbps_torch = bytes_moved / (t_torch * 1e-6) / 1e9
+        cfg = _winning_config_for(cols)
         results.append({
             "rows": rows,
             "cols": cols,
@@ -162,10 +184,12 @@ def benchmark(out_path: str | None = None) -> dict:
             "triton_gbps": round(gbps_triton, 2),
             "torch_gbps": round(gbps_torch, 2),
             "speedup": round(t_torch / t_triton, 3),
+            "autotune": cfg,
         })
         print(f"  cols={cols:5d}  triton={t_triton:7.2f}us  torch={t_torch:7.2f}us  "
-              f"triton GB/s={gbps_triton:6.1f}  speedup={t_torch / t_triton:.2f}x")
-    out = {"kernel": "fused-rmsnorm", "results": results}
+              f"triton GB/s={gbps_triton:6.1f}  speedup={t_torch / t_triton:.2f}x  "
+              f"cfg={cfg}")
+    out = {"kernel": "fused-rmsnorm", "autotuned": True, "results": results}
     if out_path:
         with open(out_path, "w") as f:
             json.dump(out, f, indent=2)
@@ -190,7 +214,7 @@ def main():
         print("OK")
         print()
     if args.bench:
-        print("=== benchmark (rows=4096) ===")
+        print("=== benchmark (rows=4096, autotuned) ===")
         benchmark(out_path=args.out)
 
 

@@ -1,0 +1,94 @@
+{
+  "kernel": "flash-attention-v2-forward-causal-fp16",
+  "dtype": "float16",
+  "autotuned": true,
+  "smem_pruned_configs": 0,
+  "live_configs": 36,
+  "results": [
+    {
+      "B": 1,
+      "H": 8,
+      "M": 128,
+      "D": 64,
+      "triton_us": 99.74,
+      "ref_us": 101.9,
+      "triton_tflops": 0.168,
+      "ref_tflops": 0.165,
+      "speedup": 1.022,
+      "autotune": {
+        "BLOCK_M": 32,
+        "BLOCK_N": 32,
+        "num_warps": 4,
+        "num_stages": 2
+      }
+    },
+    {
+      "B": 1,
+      "H": 8,
+      "M": 256,
+      "D": 64,
+      "triton_us": 161.3,
+      "ref_us": 215.5,
+      "triton_tflops": 0.416,
+      "ref_tflops": 0.311,
+      "speedup": 1.336,
+      "autotune": {
+        "BLOCK_M": 16,
+        "BLOCK_N": 32,
+        "num_warps": 2,
+        "num_stages": 3
+      }
+    },
+    {
+      "B": 1,
+      "H": 8,
+      "M": 512,
+      "D": 64,
+      "triton_us": 522.52,
+      "ref_us": 637.24,
+      "triton_tflops": 0.514,
+      "ref_tflops": 0.421,
+      "speedup": 1.22,
+      "autotune": {
+        "BLOCK_M": 32,
+        "BLOCK_N": 32,
+        "num_warps": 4,
+        "num_stages": 3
+      }
+    },
+    {
+      "B": 1,
+      "H": 8,
+      "M": 1024,
+      "D": 64,
+      "triton_us": 1897.88,
+      "ref_us": 2044.97,
+      "triton_tflops": 0.566,
+      "ref_tflops": 0.525,
+      "speedup": 1.077,
+      "autotune": {
+        "BLOCK_M": 32,
+        "BLOCK_N": 32,
+        "num_warps": 4,
+        "num_stages": 3
+      }
+    },
+    {
+      "B": 1,
+      "H": 8,
+      "M": 2048,
+      "D": 64,
+      "triton_us": 7212.97,
+      "ref_us": 7344.09,
+      "triton_tflops": 0.595,
+      "ref_tflops": 0.585,
+      "speedup": 1.018,
+      "autotune": {
+        "BLOCK_M": 32,
+        "BLOCK_N": 32,
+        "num_warps": 4,
+        "num_stages": 3
+      }
+    }
+  ]
+}

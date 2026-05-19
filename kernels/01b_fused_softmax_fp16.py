@@ -11,6 +11,12 @@ fp16 tensor cores — the only win available is bandwidth from the
 fp16 loads/stores. Expect a smaller multiplier than the fp32 case
 because the kernel was already close to bandwidth-bound at fp32.
 
+v0.3.0: wrapped in `@triton.autotune` over a (num_warps, num_stages)
+grid keyed on `n_cols`. `BLOCK_SIZE` is fixed by the launcher at
+`next_power_of_2(n_cols)`; see `01_fused_softmax.py` docstring for
+why tuning BLOCK_SIZE at the kernel level is unsafe under masked
+loads.
+
 Hardware: GTX 1650 Max-Q (Turing, compute capability 7.5).
 """
 
@@ -23,6 +29,15 @@ import triton
 import triton.language as tl
 
 
+def _softmax_fp16_autotune_configs():
+    configs = []
+    for num_warps in (2, 4, 8, 16):
+        for num_stages in (2, 4):
+            configs.append(triton.Config({}, num_warps=num_warps, num_stages=num_stages))
+    return configs
+
+
+@triton.autotune(configs=_softmax_fp16_autotune_configs(), key=["n_cols"])
 @triton.jit
 def softmax_kernel_fp16(
     output_ptr,
@@ -32,11 +47,10 @@ def softmax_kernel_fp16(
     n_rows,
     n_cols,
     BLOCK_SIZE: tl.constexpr,
-    num_stages: tl.constexpr,
 ):
     row_start = tl.program_id(0)
     row_step = tl.num_programs(0)
-    for row_idx in tl.range(row_start, n_rows, row_step, num_stages=num_stages):
+    for row_idx in tl.range(row_start, n_rows, row_step):
         row_in_ptr = input_ptr + row_idx * input_row_stride
         col_offsets = tl.arange(0, BLOCK_SIZE)
         input_ptrs = row_in_ptr + col_offsets
@@ -61,12 +75,6 @@ def triton_softmax_fp16(x: torch.Tensor) -> torch.Tensor:
     assert x.dtype == torch.float16, "expected fp16 input"
     n_rows, n_cols = x.shape
     BLOCK_SIZE = triton.next_power_of_2(n_cols)
-    num_warps = 4
-    if BLOCK_SIZE >= 2048:
-        num_warps = 8
-    if BLOCK_SIZE >= 4096:
-        num_warps = 16
-    num_stages = 4 if BLOCK_SIZE >= 2048 else 2
     y = torch.empty_like(x)
     num_programs = min(n_rows, 1024)
     softmax_kernel_fp16[(num_programs,)](
@@ -74,8 +82,6 @@ def triton_softmax_fp16(x: torch.Tensor) -> torch.Tensor:
         x.stride(0), y.stride(0),
         n_rows, n_cols,
         BLOCK_SIZE=BLOCK_SIZE,
-        num_stages=num_stages,
-        num_warps=num_warps,
     )
     return y
 
@@ -99,6 +105,21 @@ def correctness_check() -> bool:
         print(f"  shape={(rows, cols)} max_abs_err={max_abs_err:.2e} {'OK' if ok else 'FAIL'}")
         all_ok = all_ok and ok
     return all_ok
+
+
+def _winning_config_for(n_cols: int) -> dict:
+    cache = softmax_kernel_fp16.cache
+    if not cache:
+        return {}
+    for key, cfg in cache.items():
+        cols = key[0] if isinstance(key, tuple) else key
+        if cols == n_cols:
+            return {
+                "num_warps": cfg.num_warps,
+                "num_stages": cfg.num_stages,
+                **cfg.kwargs,
+            }
+    return {}
 
 
 def benchmark(out_path: str | None = None) -> dict:
@@ -129,6 +150,7 @@ def benchmark(out_path: str | None = None) -> dict:
         # fp16 = 2 bytes/element, read + write.
         gbps_triton = (rows * cols * 2 * 2) / (t_triton * 1e-6) / 1e9
         gbps_torch = (rows * cols * 2 * 2) / (t_torch * 1e-6) / 1e9
+        cfg = _winning_config_for(cols)
         results.append({
             "rows": rows,
             "cols": cols,
@@ -137,10 +159,12 @@ def benchmark(out_path: str | None = None) -> dict:
             "triton_gbps": round(gbps_triton, 2),
             "torch_gbps": round(gbps_torch, 2),
             "speedup": round(t_torch / t_triton, 3),
+            "autotune": cfg,
         })
         print(f"  cols={cols:5d}  triton={t_triton:7.2f}us  torch={t_torch:7.2f}us  "
-              f"triton GB/s={gbps_triton:6.1f}  speedup={t_torch / t_triton:.2f}x")
-    out = {"kernel": "fused-softmax-fp16", "dtype": "float16", "results": results}
+              f"triton GB/s={gbps_triton:6.1f}  speedup={t_torch / t_triton:.2f}x  "
+              f"cfg={cfg}")
+    out = {"kernel": "fused-softmax-fp16", "dtype": "float16", "autotuned": True, "results": results}
     if out_path:
         with open(out_path, "w") as f:
             json.dump(out, f, indent=2)
@@ -167,7 +191,7 @@ def main():
         print()
 
     if args.bench:
-        print("=== benchmark (rows=4096, fp16) ===")
+        print("=== benchmark (rows=4096, fp16, autotuned) ===")
         benchmark(out_path=args.out)
 
 

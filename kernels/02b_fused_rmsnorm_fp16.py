@@ -12,6 +12,10 @@ Turing's fp16 tensor cores. The win available is bandwidth from fp16
 loads/stores. The fp32 baseline already saturates ~96 GB/s of the
 GTX 1650's ~128 GB/s theoretical, so the headroom is finite.
 
+v0.3.0: `@triton.autotune` over a (num_warps, num_stages) grid keyed
+on `n_cols`. `BLOCK_SIZE` is fixed by the launcher to
+`next_power_of_2(n_cols)`.
+
 Hardware: GTX 1650 Max-Q (Turing, compute capability 7.5).
 """
 
@@ -24,6 +28,15 @@ import triton
 import triton.language as tl
 
 
+def _rmsnorm_fp16_autotune_configs():
+    configs = []
+    for num_warps in (2, 4, 8, 16):
+        for num_stages in (2, 4):
+            configs.append(triton.Config({}, num_warps=num_warps, num_stages=num_stages))
+    return configs
+
+
+@triton.autotune(configs=_rmsnorm_fp16_autotune_configs(), key=["n_cols"])
 @triton.jit
 def rmsnorm_kernel_fp16(
     x_ptr,
@@ -70,11 +83,6 @@ def triton_rmsnorm_fp16(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
     BLOCK_SIZE = triton.next_power_of_2(n_cols)
     assert BLOCK_SIZE <= 32768, \
         f"K={n_cols} (BLOCK={BLOCK_SIZE}) exceeds single-pass kernel limit"
-    num_warps = 4
-    if BLOCK_SIZE >= 2048:
-        num_warps = 8
-    if BLOCK_SIZE >= 4096:
-        num_warps = 16
 
     y = torch.empty_like(x)
     rmsnorm_kernel_fp16[(n_rows,)](
@@ -83,7 +91,6 @@ def triton_rmsnorm_fp16(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
         n_cols,
         eps,
         BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=num_warps,
     )
     return y
 
@@ -119,6 +126,21 @@ def correctness_check() -> bool:
     return all_ok
 
 
+def _winning_config_for(n_cols: int) -> dict:
+    cache = rmsnorm_kernel_fp16.cache
+    if not cache:
+        return {}
+    for key, cfg in cache.items():
+        cols = key[0] if isinstance(key, tuple) else key
+        if cols == n_cols:
+            return {
+                "num_warps": cfg.num_warps,
+                "num_stages": cfg.num_stages,
+                **cfg.kwargs,
+            }
+    return {}
+
+
 def benchmark(out_path: str | None = None) -> dict:
     torch.manual_seed(0)
     rows = 4096
@@ -149,6 +171,7 @@ def benchmark(out_path: str | None = None) -> dict:
         bytes_moved = rows * cols * 2 * 2 + cols * 2
         gbps_triton = bytes_moved / (t_triton * 1e-6) / 1e9
         gbps_torch = bytes_moved / (t_torch * 1e-6) / 1e9
+        cfg = _winning_config_for(cols)
         results.append({
             "rows": rows,
             "cols": cols,
@@ -157,10 +180,12 @@ def benchmark(out_path: str | None = None) -> dict:
             "triton_gbps": round(gbps_triton, 2),
             "torch_gbps": round(gbps_torch, 2),
             "speedup": round(t_torch / t_triton, 3),
+            "autotune": cfg,
         })
         print(f"  cols={cols:5d}  triton={t_triton:7.2f}us  torch={t_torch:7.2f}us  "
-              f"triton GB/s={gbps_triton:6.1f}  speedup={t_torch / t_triton:.2f}x")
-    out = {"kernel": "fused-rmsnorm-fp16", "dtype": "float16", "results": results}
+              f"triton GB/s={gbps_triton:6.1f}  speedup={t_torch / t_triton:.2f}x  "
+              f"cfg={cfg}")
+    out = {"kernel": "fused-rmsnorm-fp16", "dtype": "float16", "autotuned": True, "results": results}
     if out_path:
         with open(out_path, "w") as f:
             json.dump(out, f, indent=2)
@@ -185,7 +210,7 @@ def main():
         print("OK")
         print()
     if args.bench:
-        print("=== benchmark (rows=4096, fp16) ===")
+        print("=== benchmark (rows=4096, fp16, autotuned) ===")
         benchmark(out_path=args.out)
 
 
