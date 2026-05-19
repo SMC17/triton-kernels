@@ -14,10 +14,11 @@ shape Welford-style numeric stability would also apply); both are
 out of scope for v0.1.0 and are tracked in ROADMAP.md.
 
 The fused-rmsnorm-linear (RMSNorm + linear projection in one kernel)
-is a separate, harder artifact deferred to v0.2.0 — single-pass
-fusion of the norm reduction with a matmul accumulator requires
-careful shared-memory budgeting that the GTX 1650 (Turing, 64KB
-SMEM per SM) constrains tightly.
+is a separate, harder artifact deferred to v0.3 — single-pass fusion
+of the norm reduction with a matmul accumulator requires careful
+shared-memory budgeting that the GTX 1650 (Turing, 64KB SMEM per SM)
+constrains tightly. v0.2.0 ships an fp16 variant of *this* kernel as
+`02b_fused_rmsnorm_fp16.py` but not the fused linear projection.
 
 Hardware: GTX 1650 Max-Q (Turing, compute capability 7.5).
 """
@@ -72,7 +73,7 @@ def triton_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> 
     n_rows, n_cols = x.shape
     BLOCK_SIZE = triton.next_power_of_2(n_cols)
     assert BLOCK_SIZE <= 32768, \
-        f"K={n_cols} (BLOCK={BLOCK_SIZE}) exceeds single-pass kernel limit; tiled variant is v0.2.0 territory"
+        f"K={n_cols} (BLOCK={BLOCK_SIZE}) exceeds single-pass kernel limit; tiled variant is v0.3 territory"
     num_warps = 4
     if BLOCK_SIZE >= 2048:
         num_warps = 8

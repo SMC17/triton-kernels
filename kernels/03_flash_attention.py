@@ -16,9 +16,9 @@ Scope of this v0.1 artifact:
   the saved log-sum-exp + statistics, not just the output).
 - Causal mask supported (per query position, only sees keys at or
   before its own position).
-- fp32 throughout. fp16 / bf16 with tensor-core dot is a v0.2
-  optimisation; the GTX 1650 has tensor cores but the precision
-  tradeoff deserves its own benchmark column.
+- fp32 throughout. The fp16 + tensor-core variant ships as
+  `03b_flash_attention_fp16.py` (v0.2.0); bf16 is Ampere+ and not
+  available on Turing tensor cores.
 - Multi-batch, multi-head: supported. Each (batch, head) pair gets
   its own grid slot.
 
@@ -141,7 +141,7 @@ def triton_flash_attn(
     _, _, N, _ = k.shape
     assert k.shape == (B, H, N, D) and v.shape == (B, H, N, D)
     assert D in (16, 32, 64, 128), \
-        f"D_HEAD={D} not in supported tutorial set; v0.2 will autotune"
+        f"D_HEAD={D} not in supported tutorial set; autotune deferred to v0.3"
     if sm_scale is None:
         sm_scale = 1.0 / (D ** 0.5)
 
