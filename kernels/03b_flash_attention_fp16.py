@@ -34,6 +34,12 @@ autotune-construction time. fp16 dtype halves the per-element SMEM
 cost relative to fp32, so more aggressive tile sizes survive the
 pruning step here than in `03_flash_attention.py`.
 
+v0.4.0: optional `save_lse` flag mirroring `03_flash_attention.py`.
+Writes the per-row log-sum-exp (fp32 [B, H, M]) at the end of each
+Q-tile iteration. The fp16 backward kernel is deferred to v0.4.1;
+the API parity here keeps the forward-only contract consistent and
+lets a future fp16 backward consume the same buffer.
+
 Hardware: GTX 1650 Max-Q (Turing, compute capability 7.5).
 """
 
@@ -93,14 +99,16 @@ _FP16_CONFIGS, _FP16_SMEM_SKIPPED = _flash_attn_fp16_autotune_configs()
 @triton.autotune(configs=_FP16_CONFIGS, key=["M", "N", "D_HEAD"])
 @triton.jit
 def flash_attn_fwd_kernel_fp16(
-    Q_ptr, K_ptr, V_ptr, O_ptr,
+    Q_ptr, K_ptr, V_ptr, O_ptr, L_ptr,
     stride_qb, stride_qh, stride_qm, stride_qd,
     stride_kb, stride_kh, stride_kn, stride_kd,
     stride_vb, stride_vh, stride_vn, stride_vd,
     stride_ob, stride_oh, stride_om, stride_od,
+    stride_lb, stride_lh, stride_lm,
     H, M, N,
     sm_scale,
     IS_CAUSAL: tl.constexpr,
+    SAVE_LSE: tl.constexpr,
     D_HEAD: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -175,6 +183,15 @@ def flash_attn_fwd_kernel_fp16(
     O_block_ptr = o_base + q_row_offs[:, None] * stride_om + tl.arange(0, D_HEAD)[None, :] * stride_od
     tl.store(O_block_ptr, o_fp16, mask=q_mask[:, None])
 
+    # Optionally save log-sum-exp per query row (fp32). For the
+    # forward this is independent of the fp16 output cast — L_i lives
+    # entirely in the fp32 running max + log(sum) state.
+    if SAVE_LSE:
+        lse = m_i + tl.log(l_i)
+        l_base = L_ptr + pid_b * stride_lb + pid_h * stride_lh
+        L_block_ptr = l_base + q_row_offs * stride_lm
+        tl.store(L_block_ptr, lse, mask=q_mask)
+
 
 def triton_flash_attn_fp16(
     q: torch.Tensor,
@@ -182,8 +199,14 @@ def triton_flash_attn_fp16(
     v: torch.Tensor,
     sm_scale: float | None = None,
     is_causal: bool = False,
-) -> torch.Tensor:
-    """Public entry point. q/k/v are [B, H, M_or_N, D] fp16. Returns o fp16."""
+    save_lse: bool = False,
+):
+    """Public entry point. q/k/v are [B, H, M_or_N, D] fp16.
+
+    Returns:
+      - o fp16 [B, H, M, D] when `save_lse=False` (back-compat shape).
+      - (o, lse) tuple when `save_lse=True`, with `lse` fp32 [B, H, M].
+    """
     assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4
     assert q.dtype == torch.float16 and k.dtype == torch.float16 and v.dtype == torch.float16, \
         "expected fp16 inputs"
@@ -196,18 +219,28 @@ def triton_flash_attn_fp16(
         sm_scale = 1.0 / (D ** 0.5)
 
     o = torch.empty_like(q)
+    if save_lse:
+        lse = torch.empty((B, H, M), device=q.device, dtype=torch.float32)
+        l_strides = (lse.stride(0), lse.stride(1), lse.stride(2))
+    else:
+        lse = o
+        l_strides = (0, 0, 0)
     grid = lambda META: ((M + META["BLOCK_M"] - 1) // META["BLOCK_M"], B * H)
     flash_attn_fwd_kernel_fp16[grid](
-        q, k, v, o,
+        q, k, v, o, lse,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
         o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+        l_strides[0], l_strides[1], l_strides[2],
         H, M, N,
         sm_scale,
         IS_CAUSAL=is_causal,
+        SAVE_LSE=save_lse,
         D_HEAD=D,
     )
+    if save_lse:
+        return o, lse
     return o
 
 

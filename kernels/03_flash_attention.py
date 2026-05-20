@@ -35,6 +35,13 @@ estimated SMEM footprint exceeds Turing's 64KB/SM are filtered out
 at autotune construction time so the autotuner never attempts a
 config that will fail to compile.
 
+v0.4.0: optional `save_lse` flag. When set, the kernel additionally
+writes the per-row log-sum-exp `L_i = m_i + log(l_i)` (fp32, shape
+[B, H, M]) to an output buffer. The backward kernel
+(`04_flash_attention_backward.py`) consumes that buffer to recompute
+the softmax stably without re-evaluating the online max+sum
+reduction.
+
 Hardware: GTX 1650 Max-Q (Turing, compute capability 7.5).
 """
 
@@ -101,14 +108,16 @@ _FP32_CONFIGS, _FP32_SMEM_SKIPPED = _flash_attn_autotune_configs(dtype_bytes=4)
 @triton.autotune(configs=_FP32_CONFIGS, key=["M", "N", "D_HEAD"])
 @triton.jit
 def flash_attn_fwd_kernel(
-    Q_ptr, K_ptr, V_ptr, O_ptr,
+    Q_ptr, K_ptr, V_ptr, O_ptr, L_ptr,
     stride_qb, stride_qh, stride_qm, stride_qd,
     stride_kb, stride_kh, stride_kn, stride_kd,
     stride_vb, stride_vh, stride_vn, stride_vd,
     stride_ob, stride_oh, stride_om, stride_od,
+    stride_lb, stride_lh, stride_lm,
     H, M, N,
     sm_scale,
     IS_CAUSAL: tl.constexpr,
+    SAVE_LSE: tl.constexpr,
     D_HEAD: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -184,6 +193,15 @@ def flash_attn_fwd_kernel(
     O_block_ptr = o_base + q_row_offs[:, None] * stride_om + tl.arange(0, D_HEAD)[None, :] * stride_od
     tl.store(O_block_ptr, o_acc, mask=q_mask[:, None])
 
+    # Optionally save log-sum-exp per query row for the backward pass.
+    # L_i = m_i + log(l_i). Numerically stable because we never exponentiate
+    # without first subtracting the running max.
+    if SAVE_LSE:
+        lse = m_i + tl.log(l_i)
+        l_base = L_ptr + pid_b * stride_lb + pid_h * stride_lh
+        L_block_ptr = l_base + q_row_offs * stride_lm
+        tl.store(L_block_ptr, lse, mask=q_mask)
+
 
 def triton_flash_attn(
     q: torch.Tensor,
@@ -191,9 +209,15 @@ def triton_flash_attn(
     v: torch.Tensor,
     sm_scale: float | None = None,
     is_causal: bool = False,
-) -> torch.Tensor:
+    save_lse: bool = False,
+):
     """Public entry point. q/k/v are [B, H, M_or_N, D]. M==N typical for
-    self-attention. Returns o [B, H, M, D]."""
+    self-attention.
+
+    Returns:
+      - o [B, H, M, D] when `save_lse=False` (back-compat shape).
+      - (o, lse) tuple when `save_lse=True`, with `lse` fp32 [B, H, M].
+    """
     assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4
     B, H, M, D = q.shape
     _, _, N, _ = k.shape
@@ -204,21 +228,48 @@ def triton_flash_attn(
         sm_scale = 1.0 / (D ** 0.5)
 
     o = torch.empty_like(q)
+    if save_lse:
+        lse = torch.empty((B, H, M), device=q.device, dtype=torch.float32)
+        l_strides = (lse.stride(0), lse.stride(1), lse.stride(2))
+    else:
+        # Placeholder pointer + zero strides; the kernel never reads/writes
+        # via L_ptr when SAVE_LSE is False (constexpr-elided branch), but
+        # Triton still requires the argument slot to be a valid tensor.
+        lse = o  # any valid tensor pointer suffices since the branch is dead
+        l_strides = (0, 0, 0)
+
     # The grid depends on BLOCK_M which is chosen by autotune; Triton
     # supports a callable `grid` that receives the chosen Config kwargs.
     grid = lambda META: ((M + META["BLOCK_M"] - 1) // META["BLOCK_M"], B * H)
     flash_attn_fwd_kernel[grid](
-        q, k, v, o,
+        q, k, v, o, lse,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
         o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+        l_strides[0], l_strides[1], l_strides[2],
         H, M, N,
         sm_scale,
         IS_CAUSAL=is_causal,
+        SAVE_LSE=save_lse,
         D_HEAD=D,
     )
+    if save_lse:
+        return o, lse
     return o
+
+
+def triton_flash_attn_with_lse(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    sm_scale: float | None = None,
+    is_causal: bool = False,
+):
+    """Forward that always saves the per-row log-sum-exp. Convenience
+    wrapper used by the backward harness."""
+    return triton_flash_attn(q, k, v, sm_scale=sm_scale, is_causal=is_causal,
+                             save_lse=True)
 
 
 def reference_attn(q, k, v, sm_scale, is_causal: bool) -> torch.Tensor:
@@ -232,8 +283,21 @@ def reference_attn(q, k, v, sm_scale, is_causal: bool) -> torch.Tensor:
     return p @ v
 
 
+def reference_lse(q, k, v, sm_scale, is_causal: bool) -> torch.Tensor:
+    """Per-row log-sum-exp of (Q @ K^T * scale + mask)."""
+    s = (q @ k.transpose(-2, -1)) * sm_scale
+    if is_causal:
+        M, N = s.shape[-2], s.shape[-1]
+        mask = torch.tril(torch.ones((M, N), device=s.device, dtype=torch.bool))
+        s = s.masked_fill(~mask, float("-inf"))
+    return torch.logsumexp(s, dim=-1)
+
+
 def correctness_check() -> bool:
-    """Compare Triton vs reference attention across shapes and causal modes."""
+    """Compare Triton vs reference attention across shapes and causal modes.
+    Verifies both the original `save_lse=False` API (back-compat) and the
+    new `save_lse=True` path (output O still matches, and the saved LSE
+    matches the reference)."""
     torch.manual_seed(0)
     cases = [
         # (B, H, M=N, D, is_causal)
@@ -250,13 +314,26 @@ def correctness_check() -> bool:
         k = torch.randn(B, H, M, D, device="cuda", dtype=torch.float32) * 0.1
         v = torch.randn(B, H, M, D, device="cuda", dtype=torch.float32) * 0.1
         sm_scale = 1.0 / (D ** 0.5)
+        # Original API (save_lse=False) — must still pass.
         o_triton = triton_flash_attn(q, k, v, sm_scale=sm_scale, is_causal=causal)
         o_ref = reference_attn(q, k, v, sm_scale, is_causal=causal)
-        max_abs_err = (o_triton - o_ref).abs().max().item()
-        ok = torch.allclose(o_triton, o_ref, atol=1e-3, rtol=1e-3)
+        max_abs_err_o = (o_triton - o_ref).abs().max().item()
+        ok_o = torch.allclose(o_triton, o_ref, atol=1e-3, rtol=1e-3)
+        # New API (save_lse=True) — O must match the same reference, and
+        # the saved LSE must match torch.logsumexp.
+        o_triton2, lse_triton = triton_flash_attn(
+            q, k, v, sm_scale=sm_scale, is_causal=causal, save_lse=True,
+        )
+        max_abs_err_o2 = (o_triton2 - o_ref).abs().max().item()
+        lse_ref = reference_lse(q, k, v, sm_scale, is_causal=causal)
+        max_abs_err_lse = (lse_triton - lse_ref).abs().max().item()
+        ok_o2 = torch.allclose(o_triton2, o_ref, atol=1e-3, rtol=1e-3)
+        ok_lse = torch.allclose(lse_triton, lse_ref, atol=1e-4, rtol=1e-4)
+        ok = ok_o and ok_o2 and ok_lse
         flag = "OK" if ok else "FAIL"
         print(f"  B={B} H={H} M={M} D={D} causal={causal!s:5}  "
-              f"max_abs_err={max_abs_err:.2e}  {flag}")
+              f"o_err={max_abs_err_o:.2e}  o(lse)_err={max_abs_err_o2:.2e}  "
+              f"lse_err={max_abs_err_lse:.2e}  {flag}")
         all_ok = all_ok and ok
     return all_ok
 

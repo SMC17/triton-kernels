@@ -1,5 +1,163 @@
 # Changelog
 
+## v0.4.0 — 2026-05-19
+
+Flash-attention v2 BACKWARD pass (fp32, causal optional). Closes the
+v0.3.0 non-goal of "forward only — backward needs the saved
+log-sum-exp + dO statistics; that's a separate kernel of similar size."
+
+### Added
+
+- **Forward modification:** `03_flash_attention.py` and
+  `03b_flash_attention_fp16.py` gain an optional `save_lse: bool`
+  kwarg on the public entry point. When `True`, the kernel writes
+  `L_i = m_i + log(l_i)` (fp32, shape `[B, H, M]`) to an output
+  buffer at the end of each Q-tile iteration. The default
+  `save_lse=False` preserves the v0.3.0 single-tensor return shape;
+  the existing forward correctness suite passes unchanged with the
+  new optional output present.
+
+  - fp32 `03_flash_attention.py`: kernel signature gains `L_ptr` and
+    three LSE strides, plus a `SAVE_LSE: tl.constexpr` flag. The
+    save path runs `m_i + tl.log(l_i)` once per Q-tile at the
+    bottom of the kernel; the branch is constexpr-elided when
+    `save_lse=False`.
+  - fp16 `03b_flash_attention_fp16.py`: mirror change. LSE is fp32
+    regardless of input dtype (the running max+sum state already
+    lives in fp32).
+  - New convenience wrapper `triton_flash_attn_with_lse(...)` in the
+    fp32 module always saves LSE; the backward harness uses this
+    to drive the full forward+backward round-trip from one script.
+
+- **Backward kernel:** `kernels/04_flash_attention_backward.py`.
+  Three-kernel structure following Dao 2023 Section 3:
+
+  1. `flash_attn_bwd_preprocess_kernel` — computes
+     `D_i = sum(dO_i * O_i, axis=-1)` (fp32 [B, H, M]). Bandwidth-
+     bound, no autotune (fixed BLOCK_M=64).
+  2. `flash_attn_bwd_dkdv_kernel` — outer loop over K/V blocks
+     along N, inner loop over Q blocks along M. Accumulates
+     `dK_j, dV_j` in registers, writes once at end. Causal-aware:
+     skips Q blocks below the K block when `IS_CAUSAL=True`.
+  3. `flash_attn_bwd_dq_kernel` — outer loop over Q blocks along M,
+     inner loop over K/V blocks along N. Mirror image of the
+     forward iteration pattern.
+
+  Per the recomputation pattern in Dao 2023, no kernel materializes
+  the N×M attention matrix. P_ij is recomputed inside the inner
+  loop from Q, K and the saved per-row LSE.
+
+  Both backward kernels are wrapped in `@triton.autotune` over
+  `BLOCK_M ∈ {32, 64} × BLOCK_N ∈ {32, 64} × num_warps ∈ {4, 8}` at
+  `num_stages=2` (8 configs, 4 alive after the backward-specific
+  SMEM filter — the backward holds more live tiles than the forward,
+  so the per-config SMEM estimate uses a 4× multiplier instead of
+  the forward's 2×). Keyed on `(M, N, D_HEAD)`.
+
+- **Backward Python entry point:** `triton_flash_attn_backward(
+  q, k, v, o, do, lse, sm_scale=None, is_causal=False)` returning
+  `(dq, dk, dv)`. The caller is expected to have run the forward
+  with `save_lse=True` first.
+
+- `bench/04_flash_attention_backward.json` — backward sweep over
+  M=128..2048 with the autotune winning configs.
+
+### Backward correctness vs PyTorch autograd
+
+Reference: `softmax(Q @ K^T * scale + causal_mask) @ V`,
+`.backward(dO=ones_like)`. Tolerance `atol=1e-3, rtol=1e-3` per the
+spec.
+
+| Case (B, H, M, D, causal) | dQ max err | dK max err | dV max err | O max err |
+|---|---|---|---|---|
+| (1, 1, 64, 64, False)  | 2.10e-09 | 3.26e-09 | 2.38e-07 | 1.12e-08 |
+| (1, 1, 64, 64, True)   | 2.79e-09 | 5.59e-09 | 9.54e-07 | 2.98e-08 |
+| (1, 4, 128, 32, True)  | 6.54e-09 | 1.49e-08 | 7.15e-07 | 2.24e-08 |
+| (1, 4, 256, 64, True)  | 6.62e-09 | 2.98e-08 | 9.54e-07 | 2.98e-08 |
+| (2, 4, 256, 64, True)  | 8.09e-09 | 2.05e-08 | 9.54e-07 | 2.98e-08 |
+| (1, 8, 512, 64, True)  | 5.59e-09 | 2.42e-08 | 1.91e-06 | 3.17e-08 |
+| (1, 4, 1024, 64, True) | 6.50e-09 | 4.10e-08 | 1.43e-06 | 3.73e-08 |
+
+All 7 cases pass at `atol=1e-3, rtol=1e-3`. Largest observed dV
+error is `1.91e-06` (M=512 causal) — three orders of magnitude
+below the tolerance. dQ and dK are tighter still; the dV path has
+the longest reduction chain (`P^T @ dO` accumulating across every
+Q tile per K tile), so its accumulated round-off is correspondingly
+larger.
+
+### Backward perf vs `torch.nn.functional.scaled_dot_product_attention` + autograd (fp32 causal, B=1 H=8 D=64)
+
+Honest non-claim: this is **not** an apples-to-apples comparison.
+Torch's autograd path does not expose a backward-only entry point
+that takes a precomputed forward output + dO, so the torch column
+below times the full forward+backward through `.backward()`.
+Triton's column is the backward-only call (forward already done
+separately via `03_flash_attention.py` with `save_lse=True`).
+
+| M | triton bwd (us) | torch fwd+bwd (us) | triton bwd TFLOPS | ratio (torch fwd+bwd ÷ triton bwd) |
+|---|---|---|---|---|
+| 128 | 446.70 | 734.15 | 0.094 | 1.64× |
+| 256 | 768.13 | 1103.76 | 0.218 | 1.44× |
+| 512 | 2137.44 | 2925.12 | 0.314 | 1.37× |
+| 1024 | 6730.26 | 4752.52 | 0.399 | 0.71× |
+| 2048 | 26153.21 | 18517.79 | 0.411 | 0.71× |
+
+Direction: the Triton backward is competitive with (and at small M
+slightly faster than) torch's full forward+backward pipeline at
+M ≤ 512, then loses at M ∈ {1024, 2048}. Since the torch column
+includes the forward, the true backward-vs-backward gap at large
+M is **larger** than what this table shows — torch's autograd
+backward at M=2048 is being attributed >18ms that includes the
+forward. Treat this as: "the Triton fp32 backward holds up at
+small M and falls behind torch's tuned tensor-core autograd at
+large M, where torch's tensor-core advantage dominates." Closing
+that gap is what an fp16 backward (v0.4.1) would address.
+
+### Cumulative correctness (added to v0.3.0)
+
+- Flash-Attention fp32 backward — dQ/dK/dV vs torch autograd:
+  `max_abs_err ≤ 4.10e-08` for dQ, dK; `max_abs_err ≤ 1.91e-06`
+  for dV. All 7 shapes pass at `atol=1e-3, rtol=1e-3`.
+
+### Evidence vocabulary applied
+
+- `compiled` — yes, Triton 3.7.0 / PyTorch 2.5.1+cu121.
+- `unit-tested` — correctness vs torch autograd at `atol=1e-3,
+  rtol=1e-3` for dQ, dK, dV across 7 shapes.
+- `benchmarked` — wall-clock timings with warmup + sync, JSON in
+  `bench/04_flash_attention_backward.json`.
+- `hardware-verified` — measured on GTX 1650 Max-Q (Turing, cc 7.5).
+
+### Non-goals (deferred to v0.4.1 / v0.5)
+
+- **fp16 backward** (→ v0.4.1). The recomputation of P inside the
+  backward has tighter numerical-stability constraints than the
+  forward; a small fp16 error in S_ij propagates through `exp` into
+  P, through `P^T @ dO` into dV, and the cumulative error can blow
+  past the fp16 forward's `atol=1e-2` tolerance. The fp16 forward
+  already saves LSE (fp32) per the v0.4.0 forward modification, so
+  the backward consumer is in place; only the backward kernel
+  itself is pending.
+- **Variable-length sequences / arbitrary attention masks** (→ v0.5).
+  Strict causal is supported. Non-causal masks would need a per-row
+  mask infrastructure that doesn't transfer from the forward's
+  `n_offs < N` pattern.
+- **Dropout in forward and backward** (→ v0.5+). Standard FA-2
+  supports dropout with a shared RNG state across the two passes;
+  v0.4 ships without to keep the diff focused.
+- **Triton-side gradient checkpointing.** The backward recomputes
+  the attention scores and softmax from Q, K, V and the saved LSE,
+  but does not implement a separate activation-save tier.
+- **Wider backward autotune grid.** The 8-config grid (4 alive after
+  SMEM pruning) is intentionally narrow — backward kernels have
+  more live tiles than the forward, and a full
+  `BLOCK_M × BLOCK_N × num_warps × num_stages` sweep over the
+  same surface as the forward (36 configs) ran multi-minute on
+  each shape key. If a future winner lands on the grid edge, widen.
+- **bf16, fp8.** Same hardware constraints as v0.3.0 — Turing
+  tensor cores lack both.
+- **ROCm / AMD path.**
+
 ## v0.3.0 — 2026-05-19
 
 All six kernels (3 fp32 + 3 fp16) wrapped in `@triton.autotune`,

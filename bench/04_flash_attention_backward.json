@@ -1,0 +1,59 @@
+{
+  "kernel": "flash-attention-v2-backward-causal-fp32",
+  "autotuned": true,
+  "smem_pruned_configs": 4,
+  "live_configs": 4,
+  "note": "Triton timing is the backward-only call. Torch timing is the full forward+backward pass through scaled_dot_product_attention + .backward(); torch's autograd-backward path does not expose a backward-only entry point comparable to ours. The ratio column is informative but is fwd+bwd vs bwd, not bwd vs bwd.",
+  "results": [
+    {
+      "B": 1,
+      "H": 8,
+      "M": 128,
+      "D": 64,
+      "triton_bwd_us": 446.7,
+      "torch_fwd_bwd_us": 734.15,
+      "triton_bwd_tflops": 0.094,
+      "torch_full_vs_triton_bwd_ratio": 1.644
+    },
+    {
+      "B": 1,
+      "H": 8,
+      "M": 256,
+      "D": 64,
+      "triton_bwd_us": 768.13,
+      "torch_fwd_bwd_us": 1103.76,
+      "triton_bwd_tflops": 0.218,
+      "torch_full_vs_triton_bwd_ratio": 1.437
+    },
+    {
+      "B": 1,
+      "H": 8,
+      "M": 512,
+      "D": 64,
+      "triton_bwd_us": 2137.44,
+      "torch_fwd_bwd_us": 2925.12,
+      "triton_bwd_tflops": 0.314,
+      "torch_full_vs_triton_bwd_ratio": 1.369
+    },
+    {
+      "B": 1,
+      "H": 8,
+      "M": 1024,
+      "D": 64,
+      "triton_bwd_us": 6730.26,
+      "torch_fwd_bwd_us": 4752.52,
+      "triton_bwd_tflops": 0.399,
+      "torch_full_vs_triton_bwd_ratio": 0.706
+    },
+    {
+      "B": 1,
+      "H": 8,
+      "M": 2048,
+      "D": 64,
+      "triton_bwd_us": 26153.21,
+      "torch_fwd_bwd_us": 18517.79,
+      "triton_bwd_tflops": 0.411,
+      "torch_full_vs_triton_bwd_ratio": 0.708
+    }
+  ]
+}
