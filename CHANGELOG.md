@@ -1,5 +1,129 @@
 # Changelog
 
+## v0.4.2 — 2026-05-20
+
+Diagnosis-only release. Closes the v0.4.1 Type-II open flag
+("tensor-core engagement unconfirmed") via direct PTX inspection
+of v0.4.1 fp16 backward + v0.4.0 fp32 backward kernels at a
+representative shape (B=1, H=8, M=N=512, D=64, BLOCK_M=BLOCK_N=32,
+num_warps=4, num_stages=2 — the autotune winner across most of the
+v0.4.1 sweep).
+
+Full writeup: `docs/PTX_INSPECTION.md`. PTX dumps under
+`ptx-inspection/v0.4.1/` and `ptx-inspection/v0.4.0/`. Repro:
+`ptx-inspection/dump_ptx.py`.
+
+### Diagnosis
+
+**Tensor cores are NOT engaged in v0.4.1 fp16 backward (or in v0.4.0
+fp32 backward).** Both run on the SIMT `fma.rn.f32` path on this
+Triton 3.7.0 + GTX 1650 (sm_75) stack.
+
+| Kernel              | mma.sync.* | m16n8k8 | ldmatrix.sync | fma.rn.f32 |
+|---------------------|-----------:|--------:|--------------:|-----------:|
+| v0.4.1 fp16 dK/dV   |          0 |       0 |             0 |       2072 |
+| v0.4.0 fp32 dK/dV   |          0 |       0 |             0 |       2072 |
+| v0.4.1 fp16 dQ      |          0 |       0 |             0 |       1560 |
+| v0.4.0 fp32 dQ      |          0 |       0 |             0 |       1560 |
+
+Identical fma counts in fp16 vs fp32 across the matching kernels;
+zero `mma.sync` instructions in either. The only PTX difference is
+fp16↔fp32 cast traffic in the v0.4.1 variant (80 `cvt.f32.f16` + 48
+`cvt.rn.f16.f32` per dK/dV iteration). That cast overhead — without
+any tensor-core compute speedup — is why v0.4.1 fp16 is slower than
+v0.4.0 fp32 at small M (952 us vs 447 us at M=128) and only closes
+the gap at large M (28865 us vs 26153 us at M=2048) where the halved
+global-memory bandwidth amortizes.
+
+### Root cause
+
+MLIR pass-output dump (`MLIR_ENABLE_DUMP=1`) shows the dot operation
+retains a `ttg.blocked` parent encoding (`parent = #blocked8`) after
+the `TritonGPUAccelerateMatmul` pass on sm_75, rather than being
+promoted to `#nvidia_mma` (`NvidiaMmaEncodingAttr`). The pass declined
+the MMA layout assignment for these dots on Turing. Probed across 17
+distinct (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages) configs
+on a standalone fp16 matmul; none unlocked `mma.sync` on sm_75. The
+Turing fp16 mma codegen path *is* present in the Triton 3.7.0 binary
+(`callMmaTuringFp16` symbol; `mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32`
+string), so this is a layout-assignment / pipeline-gating regression
+in Triton's MLIR rewrite, not an outright codegen-missing case.
+
+`compiler.py:make_ttgir` (lines 273-299 in this Triton build) confirms
+the structural gating: modern loop-pipelining / matmul-scheduling
+passes (`add_pipeline`, `add_schedule_loops`, `add_fuse_nested_loops`)
+run only when `capability // 10 in [8, 9]` (sm_80, sm_89) or `>= 10`
+(Blackwell). sm_75 falls into the `else` branch running only
+`add_triton_licm`.
+
+### Type-I / Type-II self-audit
+
+- **Type-II closed (from v0.4.1).** "Tensor-core engagement
+  unconfirmed" flag closed with definitive PTX evidence: not engaged.
+- **Type-II caught (new in v0.4.2).** v0.4.1 prose and the
+  `04b_flash_attention_backward_fp16.py` docstring named
+  `m16n8k16` as Turing's fp16 mma — incorrect. m16n8k16 with
+  `.f32.f16.f16.f32` requires sm_80+ (Ampere). Turing's fp16 mma is
+  `m16n8k8`. Docstring corrected in v0.4.2.
+- **Type-I avoided.** v0.4.1 prose hedged ("Type-II open",
+  "v0.4.2 should inspect the generated PTX directly to confirm")
+  rather than asserting tensor-core engagement as a fact. The hedge
+  matches what PTX revealed. No retraction of a too-strong v0.4.1
+  perf claim is required.
+- **Type-II open (new).** "Backward perf gap to torch at large M"
+  cannot be closed on this hardware without a Triton backend that
+  emits Turing fp16 mma. Two paths out: (a) patch Triton's
+  `TritonGPUAccelerateMatmul` for sm_75; (b) downgrade to Triton 2.x
+  where Turing MMAv1/v2 was on the main lowering path. Both are
+  out of repo scope.
+
+### Fix considered, not shipped
+
+A kernel-side fix is not available: `tl.dot`'s `input_precision`
+parameter only affects fp32×fp32 (TF32 vs IEEE), not fp16×fp16
+layout selection. No tile-size combination unlocks the MMA layout on
+this Triton 3.7.0 sm_75 backend. The fix would require an upstream
+Triton change or a downgrade — out of scope for v0.4.2's
+"ship the diagnosis" target. Kernels themselves are not modified
+beyond the docstring correction. Correctness is unchanged from v0.4.1
+(the bench results stand; no re-bench required because compute path
+did not move).
+
+### Added
+
+- `docs/PTX_INSPECTION.md` — full writeup with PTX excerpts, MLIR
+  before/after AccelerateMatmul, fma/cast counts, probe-config grid.
+- `ptx-inspection/dump_ptx.py` — reproducible PTX dump script
+  (forces single-config autotune via `kern.configs = [...]`,
+  routes Triton cache through a tmpdir, copies the resulting
+  `*.ptx` files to `ptx-inspection/{v0.4.1,v0.4.0}/`).
+- `ptx-inspection/v0.4.1/{04b-preprocess,04b-dkdv,04b-dq}.ptx`
+- `ptx-inspection/v0.4.0/{04-preprocess,04-dkdv,04-dq}.ptx`
+
+### Changed
+
+- `kernels/04b_flash_attention_backward_fp16.py` docstring + inline
+  comments: removed the incorrect "Turing m16n8k16" claim, added
+  pointer to `docs/PTX_INSPECTION.md` for the diagnosis.
+- `kernels/03b_flash_attention_fp16.py` docstring + inline comments:
+  the v0.2.0 / v0.3.0 fp16 forward also claimed Turing tensor-core
+  engagement. Side-note PTX dump
+  (`ptx-inspection/v0.4.1/03b-forward-reference.ptx`) confirms the
+  same root cause applies — zero `mma.sync`, all SIMT `fma.rn.f32`.
+  Docstring corrected; bench numbers unchanged.
+- `.canonical-readme.md` v0.4.1 section: the "Type-II open" line is
+  now the definitive v0.4.2 answer. v0.4.0 section's "fp16 backward
+  would close the gap via tensor cores" forward-looking claim is
+  marked disproved.
+
+### Not changed
+
+- `kernels/04b_flash_attention_backward_fp16.py` kernel bodies: no
+  algorithmic or numeric change. v0.4.1 correctness (7 shapes,
+  atol=1e-2 rtol=1e-2) and v0.4.1 perf still stand verbatim.
+- `bench/04b_flash_attention_backward_fp16.json`: unchanged. The
+  bench numbers in v0.4.1 are the same numbers v0.4.2 explains.
+
 ## v0.4.1 — 2026-05-20
 
 Flash-attention v2 BACKWARD pass — fp16 variant. Consumes the saved

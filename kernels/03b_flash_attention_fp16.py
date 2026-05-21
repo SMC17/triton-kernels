@@ -3,17 +3,22 @@
 
 fp16 input variant of `03_flash_attention.py`. Q, K, V, O are fp16
 tensors; the per-tile `tl.dot(q, k^T)` and `tl.dot(p, v)` are issued
-with fp16 inputs and an fp32 accumulator (`out_dtype=tl.float32`),
-which routes through Turing's m16n8k16 / m16n8k8 fp16 tensor-core
-MMA instructions.
+with fp16 inputs and an fp32 accumulator (`out_dtype=tl.float32`).
 
-This is the kernel where the headline tensor-core thesis is tested:
-the fp32 SIMT version (`03_flash_attention.py`) lost 2–3× to torch's
-`scaled_dot_product_attention` on Turing because torch's reference
-uses tensor cores (TF32) while the SIMT path didn't. Switching this
-kernel to fp16 puts both implementations on tensor cores; the
-remaining gap (if any) reflects what Triton-on-Turing leaves on the
-table relative to torch's tuned tensor-core path.
+The original v0.2.0 docstring claimed this routes through Turing's
+"m16n8k16 / m16n8k8 fp16 tensor-core MMA instructions". **v0.4.2 PTX
+inspection (`docs/PTX_INSPECTION.md`) showed otherwise:** on this
+Triton 3.7.0 + sm_75 stack the `TritonGPUAccelerateMatmul` pass
+declines the MMA layout promotion, leaving the dot in a `#blocked`
+encoding that lowers to SIMT `fma.rn.f32`. Zero `mma.sync` in the
+v0.3.0 fp16 forward PTX. (Also: m16n8k16 with `.f32.f16.f16.f32`
+requires sm_80+; Turing's fp16 mma is m16n8k8 only.)
+
+The v0.3.0 fp16 forward perf numbers (recorded in
+`bench/03b_flash_attention_fp16_autotuned.json`) therefore reflect
+SIMT compute + halved global bandwidth + the autotune sweep, NOT
+tensor-core compute. The same root cause limits the v0.4.1 fp16
+backward (see `docs/PTX_INSPECTION.md`).
 
 Numerical considerations:
 - Online-softmax state (m_i, l_i, o_acc) stays in fp32.
@@ -150,7 +155,8 @@ def flash_attn_fwd_kernel_fp16(
         k = tl.load(K_block_ptr, mask=n_mask[:, None], other=0.0)
 
         # S = Q @ K^T * sm_scale. tl.dot inputs are fp16; accumulator is fp32.
-        # This routes through Turing's m16n8k16 fp16 mma.
+        # On sm_75 + Triton 3.7.0 this lowers to SIMT fma.rn.f32 —
+        # not Turing tensor-core mma (see docs/PTX_INSPECTION.md).
         s = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * sm_scale
 
         if IS_CAUSAL:

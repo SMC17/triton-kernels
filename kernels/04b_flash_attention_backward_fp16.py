@@ -37,10 +37,24 @@ Five matmul steps total across the two kernels:
   4. dS^T @ Q    (dK/dV kernel; accumulates dK_j across the Q loop)
   5. dS @ K      (dQ kernel; accumulates dQ_i across the K, V loop)
 
-All five route through Turing's m16n8k16 fp16 mma via `tl.dot` with
-fp16 inputs and `out_dtype=tl.float32`. This is the path v0.4.0's
-CHANGELOG named as the way to close the large-M backward gap to
-torch's tuned tensor-core autograd.
+v0.4.1 doc claimed all five route through Turing m16n8k16 fp16 mma
+via `tl.dot`. **v0.4.2 PTX inspection (`docs/PTX_INSPECTION.md`)
+disproved that claim on two counts:**
+
+  1. m16n8k16 with `.f32.f16.f16.f32` requires sm_80+ (Ampere). On
+     sm_75 (Turing) the fp16 mma flavor is m16n8k8.
+  2. Triton 3.7.0's `TritonGPUAccelerateMatmul` pass declines the
+     MMA layout promotion on sm_75 for these kernels, leaving the
+     dot in a `#blocked` layout that lowers to SIMT `fma.rn.f32` —
+     no tensor cores engaged. Identical fma counts in v0.4.1 fp16
+     PTX vs v0.4.0 fp32 PTX (2072 in dK/dV, 1560 in dQ).
+
+The fp16 path still saves bandwidth (halved global I/O on Q, K, V,
+dO, dQ, dK, dV), which is why the v0.4.1 vs v0.4.0 perf ratio closes
+at large M, but it pays cast overhead (~128 cvt.* per dK/dV
+iteration) without tensor-core compute speedup. Closing the gap to
+torch via tensor cores requires a Triton backend that emits
+`mma.sync.aligned.m16n8k8` on sm_75 — out of scope for v0.4.2.
 
 Numerical-stability concern (preserved from v0.4.0):
 - P recomputation under fp16 input multiplies (Q@K^T at fp16 inputs)
@@ -184,8 +198,9 @@ def flash_attn_bwd_preprocess_kernel_fp16(
 # ---------------------------------------------------------------------------
 # dK / dV kernel (fp16). Outer loop over K, V tiles along N. Inner loop
 # over Q tiles along M accumulates fp32 dK_j, dV_j; cast to fp16 on store.
-# All five matmul steps in the backward route through tl.dot with fp16
-# inputs and fp32 accumulator → Turing m16n8k16 tensor cores.
+# All five matmul steps in the backward use tl.dot with fp16 inputs and
+# fp32 accumulator. On sm_75 + Triton 3.7.0 these lower to SIMT fma (no
+# tensor cores) — see docs/PTX_INSPECTION.md for the v0.4.2 diagnosis.
 # ---------------------------------------------------------------------------
 @triton.autotune(configs=_FP16_BWD_CONFIGS, key=["M", "N", "D_HEAD"])
 @triton.jit
@@ -253,7 +268,8 @@ def flash_attn_bwd_dkdv_kernel_fp16(
         do = tl.load(dO_blk, mask=m_mask[:, None], other=0.0)      # fp16
 
         # S_ij = Q_i @ K_j^T * sm_scale; fp16 inputs, fp32 acc.
-        # Routes through Turing m16n8k16 fp16 mma.
+        # On sm_75 + Triton 3.7.0 this lowers to SIMT fma.rn.f32 —
+        # not Turing mma.sync.aligned.m16n8k8 (see docs/PTX_INSPECTION.md).
         s = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * sm_scale  # fp32
 
         # Reconstruct P_ij = exp(S_ij - L_i). LSE was saved in fp32
