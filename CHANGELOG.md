@@ -1,5 +1,85 @@
 # Changelog
 
+## v0.4.1 — 2026-05-20
+
+Flash-attention v2 BACKWARD pass — fp16 variant. Consumes the saved
+LSE (fp32) from `03b_flash_attention_fp16.py` (wiring already in
+place from v0.4.0). All five matmul steps route through fp16 inputs
+with `out_dtype=tl.float32` accumulation; dQ/dK/dV accumulators stay
+fp32 across the entire reduction and only cast to fp16 at the final
+store.
+
+### Added
+
+- `kernels/04b_flash_attention_backward_fp16.py` — fp16 backward
+  with three kernels (preprocess for `D_i = sum(dO * O)`, dK/dV
+  outer-over-N, dQ outer-over-M). Same algorithmic structure as
+  `04_flash_attention_backward.py` v0.4.0; differs only in input
+  dtype + the m16n8k16 mma routing through `tl.dot` with fp16 inputs.
+- `bench/04b_flash_attention_backward_fp16.json` — perf sweep.
+
+### Correctness (7 shapes, atol=1e-2 rtol=1e-2 matching fp16 forward bar)
+
+| Case (B, H, M, D, causal)  | o        | dQ       | dK       | dV       |
+|----------------------------|----------|----------|----------|----------|
+| (1, 1, 64,   64, False)    | 1.53e-05 | 3.81e-06 | 7.63e-06 | 0.00e+00 |
+| (1, 1, 64,   64, True)     | 1.22e-04 | 5.72e-06 | 1.53e-05 | 0.00e+00 |
+| (1, 4, 128,  32, True)     | 1.22e-04 | 1.53e-05 | 1.53e-05 | 1.95e-03 |
+| (1, 4, 256,  64, True)     | 1.22e-04 | 1.53e-05 | 1.53e-05 | 9.77e-04 |
+| (2, 4, 256,  64, True)     | 1.22e-04 | 1.53e-05 | 1.53e-05 | 9.77e-04 |
+| (1, 8, 512,  64, True)     | 1.22e-04 | 1.53e-05 | 1.53e-05 | 3.91e-03 |
+| (1, 4, 1024, 64, True)     | 1.22e-04 | 1.53e-05 | 1.53e-05 | 1.95e-03 |
+
+All within tolerance. Largest observed error 3.91e-03 (dV at M=512
+causal), well inside the 1e-2 bar. dV's reduction chain remains the
+longest in fp16 as it was in fp32, and dV's error scales accordingly.
+
+### Backward perf (B=1, H=8, D=64, causal=True, fp16, M-sweep)
+
+| M    | triton bwd (us) | torch fwd+bwd (us) | triton bwd TFLOPS | ratio (torch ÷ triton bwd) |
+|------|-----------------|--------------------|--------------------|------------------------------|
+|  128 |    951.94       |    1425.36         | 0.044              | 1.50×                        |
+|  256 |    934.59       |     902.03         | 0.180              | 0.97×                        |
+|  512 |   1985.04       |    2216.07         | 0.338              | 1.12×                        |
+| 1024 |   7305.95       |    6965.66         | 0.367              | 0.95×                        |
+| 2048 |  28864.98       |   24784.02         | 0.372              | 0.86×                        |
+
+**Honest non-claim preserved from v0.4.0**: not apples-to-apples. Torch
+column is fwd+bwd; triton column is bwd-only. Torch has no
+backward-only entry point. The true bwd-vs-bwd gap at large M is
+LARGER than this table shows.
+
+Versus v0.4.0 fp32 backward at M=2048 (ratio 0.71×): v0.4.1 fp16 sits
+at 0.86× — closes the gap but does not pass torch. At M=128, v0.4.1
+fp16 backward is SLOWER than v0.4.0 fp32 backward (952 us vs 447 us);
+the fp16 path has per-launch overhead that doesn't amortize until
+M ~ 256.
+
+### Type-I / Type-II self-audit
+
+- **Type-II open — tensor-core engagement unconfirmed.** Autotuner
+  picked `(BLOCK_M=32, BLOCK_N=32, num_warps=4, num_stages=2)` for
+  both kernels at every shape except M=2048 dq (BLOCK_N=64). fp16
+  being slower than fp32 at small M is the wrong signature for a
+  Turing m16n8k16-engaged path — under tensor cores fp16 should beat
+  fp32 at every M, not lose at small M. `tl.dot` with fp16 inputs +
+  `out_dtype=tl.float32` SHOULD route through tensor cores, but the
+  empirical perf signature does not match. v0.4.2 should inspect the
+  generated PTX directly to confirm.
+- **Type-II open — autotune grid edge.** M=2048 dq kernel picked the
+  `BLOCK_N=64` upper edge of the grid. Grid widening deferred to
+  v0.4.2 alongside the tensor-core diagnosis.
+- **Type-I avoided — perf framing.** Did not let "fp16 closes the
+  bwd-vs-fwd+bwd gap" slide into "fp16 backward beats torch." Same
+  honest-non-claim framing preserved from v0.4.0.
+
+### What is *not* in v0.4.1
+
+- PTX-confirmed m16n8k16 tensor-core engagement (deferred to v0.4.2)
+- Variable-length sequence masks (deferred to v0.5)
+- Dropout in backward (deferred to v0.5+)
+- Wider autotune grid (deferred to v0.4.2)
+
 ## v0.4.0 — 2026-05-19
 
 Flash-attention v2 BACKWARD pass (fp32, causal optional). Closes the
