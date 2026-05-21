@@ -1,0 +1,120 @@
+{
+  "kernel": "flash-attention-v2-backward-causal-fp16",
+  "dtype": "float16",
+  "autotuned": true,
+  "smem_pruned_configs": 0,
+  "live_configs": 8,
+  "note": "Triton timing is the backward-only call. Torch timing is the full forward+backward pass through scaled_dot_product_attention + .backward(); torch's autograd-backward path does not expose a backward-only entry point comparable to ours. The ratio column is informative but is fwd+bwd vs bwd, not bwd vs bwd.",
+  "results": [
+    {
+      "B": 1,
+      "H": 8,
+      "M": 128,
+      "D": 64,
+      "triton_bwd_us": 951.94,
+      "torch_fwd_bwd_us": 1425.36,
+      "triton_bwd_tflops": 0.044,
+      "torch_full_vs_triton_bwd_ratio": 1.497,
+      "autotune_dkdv": {
+        "BLOCK_M": 32,
+        "BLOCK_N": 32,
+        "num_warps": 4,
+        "num_stages": 2
+      },
+      "autotune_dq": {
+        "BLOCK_M": 32,
+        "BLOCK_N": 32,
+        "num_warps": 4,
+        "num_stages": 2
+      }
+    },
+    {
+      "B": 1,
+      "H": 8,
+      "M": 256,
+      "D": 64,
+      "triton_bwd_us": 934.59,
+      "torch_fwd_bwd_us": 902.03,
+      "triton_bwd_tflops": 0.18,
+      "torch_full_vs_triton_bwd_ratio": 0.965,
+      "autotune_dkdv": {
+        "BLOCK_M": 32,
+        "BLOCK_N": 32,
+        "num_warps": 4,
+        "num_stages": 2
+      },
+      "autotune_dq": {
+        "BLOCK_M": 32,
+        "BLOCK_N": 32,
+        "num_warps": 4,
+        "num_stages": 2
+      }
+    },
+    {
+      "B": 1,
+      "H": 8,
+      "M": 512,
+      "D": 64,
+      "triton_bwd_us": 1985.04,
+      "torch_fwd_bwd_us": 2216.07,
+      "triton_bwd_tflops": 0.338,
+      "torch_full_vs_triton_bwd_ratio": 1.116,
+      "autotune_dkdv": {
+        "BLOCK_M": 32,
+        "BLOCK_N": 32,
+        "num_warps": 4,
+        "num_stages": 2
+      },
+      "autotune_dq": {
+        "BLOCK_M": 32,
+        "BLOCK_N": 32,
+        "num_warps": 4,
+        "num_stages": 2
+      }
+    },
+    {
+      "B": 1,
+      "H": 8,
+      "M": 1024,
+      "D": 64,
+      "triton_bwd_us": 7305.95,
+      "torch_fwd_bwd_us": 6965.66,
+      "triton_bwd_tflops": 0.367,
+      "torch_full_vs_triton_bwd_ratio": 0.953,
+      "autotune_dkdv": {
+        "BLOCK_M": 32,
+        "BLOCK_N": 32,
+        "num_warps": 4,
+        "num_stages": 2
+      },
+      "autotune_dq": {
+        "BLOCK_M": 32,
+        "BLOCK_N": 32,
+        "num_warps": 4,
+        "num_stages": 2
+      }
+    },
+    {
+      "B": 1,
+      "H": 8,
+      "M": 2048,
+      "D": 64,
+      "triton_bwd_us": 28864.98,
+      "torch_fwd_bwd_us": 24784.02,
+      "triton_bwd_tflops": 0.372,
+      "torch_full_vs_triton_bwd_ratio": 0.859,
+      "autotune_dkdv": {
+        "BLOCK_M": 32,
+        "BLOCK_N": 32,
+        "num_warps": 4,
+        "num_stages": 2
+      },
+      "autotune_dq": {
+        "BLOCK_M": 32,
+        "BLOCK_N": 64,
+        "num_warps": 4,
+        "num_stages": 2
+      }
+    }
+  ]
+}
