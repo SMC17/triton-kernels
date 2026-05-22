@@ -657,6 +657,32 @@ def benchmark(out_path: str | None = None) -> dict:
         torch.cuda.synchronize()
         t_torch_full = (time.perf_counter() - t0) / n_iter * 1e6
 
+        # ----- apples-to-apples torch backward-only timing (v0.4.3) -----
+        # See 04_flash_attention_backward.py for the rationale; same
+        # pattern adapted to fp16. autograd.grad(retain_graph=True)
+        # times only the backward call after a single untimed forward.
+        q_b = q.clone().requires_grad_(True)
+        k_b = k.clone().requires_grad_(True)
+        v_b = v.clone().requires_grad_(True)
+        o_ref_b = torch.nn.functional.scaled_dot_product_attention(
+            q_b, k_b, v_b, is_causal=True,
+        )
+        grad_out = torch.ones_like(o_ref_b)
+        for _ in range(3):
+            torch.autograd.grad(
+                outputs=o_ref_b, inputs=[q_b, k_b, v_b],
+                grad_outputs=grad_out, retain_graph=True,
+            )
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(n_iter):
+            torch.autograd.grad(
+                outputs=o_ref_b, inputs=[q_b, k_b, v_b],
+                grad_outputs=grad_out, retain_graph=True,
+            )
+        torch.cuda.synchronize()
+        t_torch_bwd_only = (time.perf_counter() - t0) / n_iter * 1e6
+
         # Backward FLOPs: 5 N×M×D matmuls in the causal backward,
         # halved by the causal mask. Same accounting as v0.4.0.
         flops = 10 * B * H * M * M * D * 0.5
@@ -668,13 +694,16 @@ def benchmark(out_path: str | None = None) -> dict:
             "B": B, "H": H, "M": M, "D": D,
             "triton_bwd_us": round(t_triton_bwd, 2),
             "torch_fwd_bwd_us": round(t_torch_full, 2),
+            "torch_bwd_only_us": round(t_torch_bwd_only, 2),
             "triton_bwd_tflops": round(tflops_triton, 3),
             "torch_full_vs_triton_bwd_ratio": round(t_torch_full / t_triton_bwd, 3),
+            "torch_bwd_only_vs_triton_bwd_ratio": round(t_torch_bwd_only / t_triton_bwd, 3),
             "autotune_dkdv": dkdv_cfg,
             "autotune_dq": dq_cfg,
         })
         print(f"  B={B} H={H} M={M:5d} D={D}  triton_bwd={t_triton_bwd:9.2f}us  "
               f"torch_fwd+bwd={t_torch_full:9.2f}us  "
+              f"torch_bwd_only={t_torch_bwd_only:9.2f}us  "
               f"triton_bwd TFLOPS={tflops_triton:.3f}  "
               f"dkdv={dkdv_cfg}  dq={dq_cfg}")
     out = {
@@ -684,12 +713,15 @@ def benchmark(out_path: str | None = None) -> dict:
         "smem_pruned_configs": _FP16_BWD_SMEM_SKIPPED,
         "live_configs": len(_FP16_BWD_CONFIGS),
         "note": (
-            "Triton timing is the backward-only call. Torch timing is "
-            "the full forward+backward pass through "
-            "scaled_dot_product_attention + .backward(); torch's "
-            "autograd-backward path does not expose a backward-only "
-            "entry point comparable to ours. The ratio column is "
-            "informative but is fwd+bwd vs bwd, not bwd vs bwd."
+            "Triton timing is the backward-only call. "
+            "`torch_fwd_bwd_us` times the full forward+backward through "
+            "scaled_dot_product_attention + .backward() (kept from "
+            "v0.4.1 for back-compat). `torch_bwd_only_us` (v0.4.3) "
+            "times torch's backward in isolation via "
+            "torch.autograd.grad(retain_graph=True) against a "
+            "pre-computed forward graph — apples-to-apples bwd-vs-bwd. "
+            "Both columns are SIMT-vs-SIMT on sm_75 per v0.4.2 PTX "
+            "diagnosis; the SIMT-path perf bar has not moved."
         ),
         "results": results,
     }

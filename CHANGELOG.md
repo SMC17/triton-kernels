@@ -1,5 +1,167 @@
 # Changelog
 
+## v0.4.3 — 2026-05-21
+
+Two small clarifying lanes from v0.4.2's STATUS.md "Open" section.
+No kernel-body changes; no perf-bar movement; the v0.4.2 PTX finding
+(tensor cores not engaged on sm_75) remains the active bar. This
+release closes the open items at the documentation + harness level
+and lets the v0.4.x line wind down cleanly.
+
+### Added
+
+- `torch_bwd_only_us` column in the backward benchmark functions of
+  both `kernels/04_flash_attention_backward.py` (fp32) and
+  `kernels/04b_flash_attention_backward_fp16.py` (fp16). Implements
+  apples-to-apples SIMT-vs-SIMT timing by issuing
+  `torch.autograd.grad(outputs=O, inputs=[Q,K,V], grad_outputs=dO,
+  retain_graph=True)` against a once-computed forward graph — the
+  call times *only* the backward, addressing the v0.4.0/v0.4.1
+  honest-non-claim that SDPA exposed no backward-only entry. The
+  existing `torch_fwd_bwd_us` column is preserved verbatim for
+  back-compatibility with documented v0.4.0/v0.4.1 numbers.
+
+- `scripts/run_correctness_sweep.sh` — local pass/fail sweep across
+  every kernel's `--correctness` mode. Eight kernels total (the
+  v0.3.0-era "six-kernel" label became 8 once the v0.4 backward
+  suite arrived: 01, 01b, 02, 02b, 03, 03b, 04, 04b). Exit code 0
+  iff every kernel passes; non-zero on any fail. NOT a hosted CI
+  pipeline — no GitHub Actions. Local-script discipline only. A
+  pre-tag invocation pattern is documented inside the script
+  (operator wires it into their release flow if desired; this
+  release does not install the hook).
+
+  Manual invocation:
+
+      scripts/run_correctness_sweep.sh
+
+  Sample output (annotated; actual run blocked this session — see
+  "Re-bench / re-sweep deferred" below):
+
+      == 01_fused_softmax ==
+        -> PASS (Ns)
+      == 01b_fused_softmax_fp16 ==
+        -> PASS (Ns)
+      ...
+      ================================================================
+        correctness sweep summary  (8 kernels, total Ts)
+      ================================================================
+        kernel                                    status   secs
+        ------                                    ------   ----
+        01_fused_softmax                          PASS     ...
+        01b_fused_softmax_fp16                    PASS     ...
+        02_fused_rmsnorm                          PASS     ...
+        02b_fused_rmsnorm_fp16                    PASS     ...
+        03_flash_attention                        PASS     ...
+        03b_flash_attention_fp16                  PASS     ...
+        04_flash_attention_backward               PASS     ...
+        04b_flash_attention_backward_fp16         PASS     ...
+
+      PASS — all 8 kernels green.
+
+### Re-bench / re-sweep deferred to v0.4.4
+
+The column-emitting code and the sweep script ship this release. The
+*new* numeric column and the green sweep transcript do not — this
+session's `/dev/nvidia-uvm` returned EIO under the working driver
+(`595.71.05`, kernel-side state mismatch), CUDA failed to initialize
+in PyTorch, and no kernel could be exercised live. The fix
+(`sudo rmmod nvidia_uvm && sudo modprobe nvidia_uvm`, or a reboot)
+is a fleet-state action outside this session's commit budget. Per
+the v0.4.x discipline ("don't fabricate numbers"), the bench JSON
+files are left unmodified and carry the v0.4.0/v0.4.1 columns
+verbatim until a clean-CUDA session re-runs them.
+
+When CUDA is restored:
+
+    triton-python kernels/04_flash_attention_backward.py \
+        --bench --out bench/04_flash_attention_backward.json
+    triton-python kernels/04b_flash_attention_backward_fp16.py \
+        --bench --out bench/04b_flash_attention_backward_fp16.json
+    scripts/run_correctness_sweep.sh
+
+That run will populate `torch_bwd_only_us` +
+`torch_bwd_only_vs_triton_bwd_ratio` in both JSON files and produce
+the sweep transcript. v0.4.4 will ship as a numbers-only update.
+
+### Changed
+
+- `kernels/04_flash_attention_backward.py` benchmark `note` field
+  updated to describe the two-column structure (fwd+bwd preserved
+  for back-compat; bwd-only added in v0.4.3 as the apples-to-apples
+  SIMT-vs-SIMT comparison). Same on `04b_*_fp16.py`.
+
+### Interpretation (forward-looking, gated on the deferred re-bench)
+
+What the new `torch_bwd_only_us` column gives us that
+`torch_fwd_bwd_us` did not:
+
+- `torch_fwd_bwd_us` includes a forward pass that the triton column
+  does not. At small M the forward is a non-trivial fraction of the
+  fwd+bwd wallclock (the v0.4.1 M=128 fp16 row: 1425 us fwd+bwd
+  against ~951 us triton bwd-only). At large M the forward shrinks
+  as a fraction (M=2048 fp16: 24784 us fwd+bwd, of which the
+  forward is ~5-10% — `bench/03b_flash_attention_fp16.json` puts
+  the M=2048 fp16 forward at ~6900 us).
+- The v0.4.1 documented ratio at M=2048 fp16 was 0.86× (24784 us
+  fwd+bwd ÷ 28865 us triton bwd-only). Subtracting the ~6.9k-us
+  forward gives a bwd-only torch estimate of ~17.9k us, which would
+  shift the apples-to-apples ratio to ~0.62× — torch's backward is
+  faster than the table suggested, because the table charged torch
+  for the forward.
+- This is the prediction the new column will confirm or refute.
+  The v0.4.2 PTX finding (zero `mma.sync`, all SIMT `fma.rn.f32`
+  on sm_75) means *both* implementations are on the SIMT path; the
+  comparison is therefore SIMT-vs-SIMT — clean, but torch's SIMT
+  backward enjoys cuDNN-tuned kernel fusion that the triton path
+  does not.
+
+The new column is **informational, not a perf unlock**. The v0.4.2
+bar (tensor cores not engaged on sm_75) is unchanged. Closing the
+real gap requires path 1 (Triton MLIR patch) or path 3 (Ampere+
+hardware) per STATUS.md.
+
+### Type-I / Type-II self-audit
+
+- **Type-II caught (this release).** v0.4.0/v0.4.1 perf tables
+  hedged with "not apples-to-apples" honest-non-claims but did not
+  ship a code change to *measure* apples-to-apples. The hedge
+  was correct as written; the missing measurement was a Type-II
+  (under-claim of capability — the measurement was straightforward
+  via `torch.autograd.grad(retain_graph=True)`). v0.4.3 fills it.
+- **Type-I avoided — perf-unlock framing.** Did not let "apples-to-
+  apples column" slide into "we closed the gap." The v0.4.2 SIMT
+  bar holds; the comparison is cleaner, the ratio likely worsens
+  on the new column at large M, not better. Honest column note
+  in the JSON `note` field calls this out.
+- **Type-II open — re-bench deferred.** Code ships; numbers do not.
+  The CHANGELOG sample-output and interpretation are predictions,
+  not measurements. v0.4.4 closes this when the fleet's UVM
+  recovers.
+- **Type-II avoided — sweep-script scope.** Documented explicitly
+  as a local script, not a CI pipeline. Did not claim a GitHub
+  Actions workflow that does not exist.
+
+### Naming
+
+- "Six-kernel sweep" was the v0.3.0 vocabulary when there were six
+  kernels (`01`, `01b`, `02`, `02b`, `03`, `03b`). v0.4 added the
+  backward suite (`04`, `04b`) bringing it to eight. The script
+  uses the accurate count ("8 kernels") in its summary line; the
+  STATUS.md "Open" entry that used "six-kernel" wording is closed
+  with the 8-kernel script.
+
+### Not changed
+
+- Bench JSON files (`bench/04_flash_attention_backward.json`,
+  `bench/04b_flash_attention_backward_fp16.json`): the v0.4.0 /
+  v0.4.1 / v0.4.2 columns and numbers stand verbatim. v0.4.4 will
+  add the `torch_bwd_only_us` rows.
+- Kernel algorithmic bodies: no change. Correctness is unchanged
+  from v0.4.1 (atol=1e-2 rtol=1e-2 fp16; atol=1e-3 rtol=1e-3 fp32).
+- The v0.4.2 PTX diagnosis: still the active read on tensor-core
+  engagement. v0.5 stays blocked per STATUS.md.
+
 ## v0.4.2 — 2026-05-20
 
 Diagnosis-only release. Closes the v0.4.1 Type-II open flag

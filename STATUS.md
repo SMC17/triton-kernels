@@ -6,6 +6,26 @@ shape of this file mirrors `fleet-sbom-index/STATUS.md` and
 
 ## Released
 
+### v0.4.3 — 2026-05-21 — apples-to-apples bench column + 8-kernel sweep script
+- `torch_bwd_only_us` column added to both `04` (fp32) and `04b`
+  (fp16) backward benchmark functions. Uses
+  `torch.autograd.grad(outputs=O, inputs=[Q,K,V], grad_outputs=dO,
+  retain_graph=True)` against a once-computed forward graph — times
+  torch's backward in isolation, no SDPA backward-only entry needed.
+  Existing `torch_fwd_bwd_us` column preserved for back-compat with
+  the v0.4.0 / v0.4.1 documented numbers.
+- `scripts/run_correctness_sweep.sh` ships the local 8-kernel
+  no-regression sweep. Exit non-zero on any fail. Local script, not
+  a hosted CI pipeline; pre-tag invocation pattern documented in
+  the script header for operator wiring.
+- Re-bench + sweep transcript deferred to v0.4.4 — this session's
+  `/dev/nvidia-uvm` returned EIO under driver `595.71.05` (kernel
+  module reload needed, sudo required). Code + script ship; the
+  new numeric column populates on next clean-CUDA run.
+- Type-II caught: v0.4.0/v0.4.1's honest-non-claim ("torch has no
+  backward-only entry") under-claimed; the measurement was
+  straightforward via `autograd.grad(retain_graph=True)`. Filled.
+
 ### v0.4.2 — 2026-05-21 — PTX-level diagnosis closing the tensor-core question
 - PTX dumps of v0.4.1 fp16 backward + v0.4.0 fp32 backward at the
   autotune-winner shape (B=1, H=8, M=N=512, D=64, BLOCK_M=BLOCK_N=32,
@@ -95,13 +115,15 @@ v0.4.2's PTX diagnosis pulls that motivation apart:
 
 ## Open
 
-- **v0.4.3 candidate — measure SIMT path against torch's SIMT path.**
-  v0.4.0–v0.4.2 compare triton bwd-only against torch fwd+bwd, which
-  is honest but not load-bearing for the "is the kernel fast" question.
-  Adding a torch-eager backward-only invocation (via custom autograd
-  function exposing `.backward()` separately) would give apples-to-
-  apples SIMT-vs-SIMT numbers. Small lane; clarifying not unlocking.
-- **No-regression sweep across all six kernels.** v0.3.0's six fp32
-  and fp16 forwards still pass per agent-spot-checks, but a CI script
-  that runs every correctness suite on every commit is not in place.
-  Manual confidence; not audited.
+- **v0.4.4 — populate `torch_bwd_only_us` numbers.** Code shipped in
+  v0.4.3; numbers blocked on a clean-CUDA session (driver `595.71.05`
+  + `nvidia_uvm` reload). Once unblocked, re-run benches at the same
+  shapes (B=1, H=8, D=64, causal=True, M ∈ {128, 256, 512, 1024, 2048})
+  and refresh `bench/04_flash_attention_backward.json` +
+  `bench/04b_flash_attention_backward_fp16.json` with the new column.
+  Bench JSON files left unmodified in v0.4.3 to preserve v0.4.x
+  numeric history.
+- **8-kernel sweep transcript capture.** Script shipped in v0.4.3;
+  the actual `PASS / ... / PASS` transcript is gated on the same
+  CUDA recovery. Once captured, paste into v0.4.4's CHANGELOG
+  sample-output block in place of the v0.4.3 annotated template.
