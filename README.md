@@ -1,7 +1,11 @@
 # triton-kernels
 
-[![License: AGPL-3.0-or-later](https://img.shields.io/badge/License-AGPL--3.0--or--later-blue.svg)](LICENSE)
-[![test](https://github.com/SMC17/triton-kernels/actions/workflows/test.yml/badge.svg)](https://github.com/SMC17/triton-kernels/actions/workflows/test.yml)
+> 8 autotuned Triton kernels — softmax · RMSNorm · flash-attention v2 (fwd + bwd, fp32 + fp16). Hardware floor: sm_75 fp32 / Ampere+ for honest fp16 perf.
+
+[![CI](https://github.com/SMC17/triton-kernels/actions/workflows/test.yml/badge.svg)](https://github.com/SMC17/triton-kernels/actions)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL_3.0-blue.svg)](LICENSE)
+[![Triton](https://img.shields.io/badge/Triton-2.x-purple.svg)](https://github.com/openai/triton)
+[![Tests: 7/7 (CPU contract)](https://img.shields.io/badge/tests-7%2F7%20CPU-success.svg)](#tests)
 
 Triton kernels for inference primitives, paired with correctness +
 benchmark harnesses against PyTorch references. fp32 + fp16 forward
@@ -12,6 +16,30 @@ Pre-1.0 substrate. No stability claims. Bench numbers were measured
 on a single Turing GPU (GTX 1650, sm_75); see [`STATUS.md`](STATUS.md)
 for the live state register and [`CHANGELOG.md`](CHANGELOG.md) for the
 full release log.
+
+## Architecture
+
+```mermaid
+flowchart TB
+    subgraph Kernels
+        S1[softmax fp32]
+        S2[softmax fp16]
+        R1[RMSNorm fp32]
+        R2[RMSNorm fp16]
+        FW1[FA-v2 fwd fp32]
+        FW2[FA-v2 fwd fp16]
+        BW1[FA-v2 bwd fp32]
+        BW2[FA-v2 bwd fp16]
+    end
+    A[Triton autotuner] --> S1 & S2 & R1 & R2 & FW1 & FW2 & BW1 & BW2
+    style FW2 fill:#fef3c7,stroke:#d97706
+    style BW2 fill:#fef3c7,stroke:#d97706
+```
+
+Highlighted nodes (fp16 fwd/bwd) need Ampere+ for honest perf numbers —
+the Triton 3.7.0 MLIR pipeline declines the tensor-core layout
+assignment on sm_75, leaving fp16 dot on the SIMT `fma.rn.f32` path
+(see [`docs/PTX_INSPECTION.md`](docs/PTX_INSPECTION.md)).
 
 ## What ships
 
