@@ -1,0 +1,81 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# What this CI exercises (substrate-honest scope):
+#
+# - Lints all kernel Python with ruff.
+# - Parses every kernel via ast.parse to catch syntax regressions.
+# - Runs the smoke-test contract (public entry-point + autotune-grid
+#   helper presence per kernel).
+#
+# What this CI CANNOT exercise on GitHub-hosted free runners:
+#
+# - Triton kernel compilation. Triton's MLIR/LLVM backends need an
+#   NVIDIA driver + CUDA runtime; free GitHub runners are CPU-only.
+# - PyTorch CUDA correctness. Same constraint.
+# - The 8-kernel correctness sweep in `scripts/run_correctness_sweep.sh`.
+#   That script self-aborts when triton-python (the bench-host wrapper)
+#   is not on PATH; it is intended for the bench host with a Turing+
+#   NVIDIA GPU, not for hosted CI.
+# - The benchmark JSONs under `bench/`. Bench numbers come from runs on
+#   the documented hardware (see README.md `## Reproducibility`).
+#
+# Adding a CUDA-capable self-hosted runner would close this gap; until
+# then, STATUS.md is the source of truth for the bench-host run record.
+
+jobs:
+  lint-and-smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install lint + test deps (no Triton, no PyTorch, no CUDA)
+        run: |
+          python -m pip install --upgrade pip
+          # Pin to a recent ruff that matches the rule set this repo expects.
+          python -m pip install "ruff>=0.5.0,<0.10.0" "pytest>=7,<9"
+
+      - name: Lint kernels with ruff
+        # E501 (line length) — kernel files document non-trivial PTX / MLIR
+        #   detail in long comments and we prioritise readability there.
+        # F401 — `triton.language as tl` is imported as a namespace for kernel
+        #   bodies; ruff can't see the @triton.jit-compiled use.
+        # E741 — `l, m, L, M` are the canonical flash-attention variable names
+        #   from Dao 2023; renaming them obscures the paper-to-code map.
+        # F841 — benchmark warmup loops `y_t = triton_kernel(x)` are intentional
+        #   timing-loop sinks; the assignment is the load-bearing work.
+        # E731 — Triton autotune requires `grid = lambda META: ...`; this is
+        #   the upstream API, not a stylistic choice.
+        # F541 — single PTX-dump diagnostic uses an f-string for visual
+        #   consistency with surrounding f-strings.
+        run: |
+          ruff check kernels/ ptx-inspection/ tests/ \
+            --select E,F,W \
+            --ignore E501,F401,E741,F841,E731,F541
+
+      - name: Verify Python syntax across all kernel files
+        run: |
+          python -m py_compile \
+            kernels/01_fused_softmax.py \
+            kernels/01b_fused_softmax_fp16.py \
+            kernels/02_fused_rmsnorm.py \
+            kernels/02b_fused_rmsnorm_fp16.py \
+            kernels/03_flash_attention.py \
+            kernels/03b_flash_attention_fp16.py \
+            kernels/04_flash_attention_backward.py \
+            kernels/04b_flash_attention_backward_fp16.py \
+            ptx-inspection/dump_ptx.py
+
+      - name: Smoke test (kernel inventory + public-API contract)
+        run: |
+          python -m pytest tests/ -v

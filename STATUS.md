@@ -113,6 +113,53 @@ v0.4.2's PTX diagnosis pulls that motivation apart:
 - v0.5 stays parked until path 1 lands OR a path-3 unlock arrives.
 - DO NOT pursue path 2 (downgrade) without a path-1 timeline.
 
+## Bench-host CUDA path
+
+As of 2026-05-27 the bench host's Triton venv at
+`~/.cache/triton-venv-host/` is **not present** (wiped at some prior
+point and not yet rebuilt). The `~/.local/bin/triton-python` wrapper
+exits non-zero with:
+
+```
+triton-python: venv python not found at /home/user/.cache/triton-venv-host/bin/python
+                check ~/.cache/triton-venv-host/ exists and is healthy
+```
+
+Until the venv is rebuilt and a fresh smoke-run of the eight-kernel
+correctness sweep is captured, the bench numbers in `bench/` reflect
+the most recent successful run on this bench host (the v0.4.x history
+in `CHANGELOG.md`). Code is unchanged; the gap is the local runtime.
+
+Out of scope for this register: rebuilding the venv. That work needs
+the kernel driver state + `nvidia_uvm` reload noted in v0.4.3 above
+and is a separate operator task, not a kernel-side change.
+
+## Continuous integration
+
+`.github/workflows/test.yml` runs on every push and PR. It exercises
+what a CPU-only GitHub-hosted runner can verify:
+
+- `ruff check` across `kernels/`, `ptx-inspection/`, `tests/` with a
+  documented ignore-set (autotune-lambda grids, intentional benchmark
+  timing-loop sinks, paper-canonical variable names).
+- `python -m py_compile` against every kernel file to catch syntax
+  regressions.
+- `pytest tests/` — the smoke-test contract in `tests/test_smoke.py`
+  verifies kernel inventory, public-API entry-point names, and
+  autotune-grid helper presence.
+
+What CI CANNOT do on free hosted runners (substrate-honest limitation):
+
+- Compile any kernel. Triton's MLIR/LLVM backends need a CUDA runtime;
+  free GitHub runners are CPU-only.
+- Exercise the bench harnesses or the local 8-kernel sweep.
+- Validate benchmark JSON against a fresh run.
+
+Closing that gap would need either (a) a self-hosted CUDA-capable
+runner, or (b) a parallel runner on a hosted CUDA service. Neither is
+in scope for this artifact; STATUS.md remains the source of truth for
+the bench-host run record.
+
 ## Open
 
 - **v0.4.4 — populate `torch_bwd_only_us` numbers.** Code shipped in
