@@ -1,5 +1,7 @@
 # triton-kernels
 
+**[Status](STATUS.md) · [Roadmap](ROADMAP.md) · [Contributing](CONTRIBUTING.md) · [Issues](https://github.com/SMC17/triton-kernels/issues) · [Public roadmap](https://github.com/users/SMC17/projects/16)**
+
 > 8 autotuned Triton kernels — softmax · RMSNorm · flash-attention v2 (fwd + bwd, fp32 + fp16). Hardware floor: sm_75 fp32 / Ampere+ for honest fp16 perf.
 
 [![CI](https://github.com/SMC17/triton-kernels/actions/workflows/test.yml/badge.svg)](https://github.com/SMC17/triton-kernels/actions)
